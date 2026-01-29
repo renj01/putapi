@@ -1,8 +1,6 @@
-// OpenAI-compatible Chat Completions -> Puter Drivers API
-// Patch: normalize non-string content (some upstreams return content as an array/list of parts).
-// Also prevents SSE from being sent to JSON-only clients.
-//
-// Drivers API: POST /drivers/call
+// OpenAI-compatible Chat Completions -> Puter Drivers API + token rotation
+import { getToken, hasAnyToken, reportTokenResult } from '../../_lib/tokenPool.js';
+
 const DRIVER_PATH = '/drivers/call';
 const HOSTS = ['https://api.puter.com', 'https://puter.com'];
 
@@ -21,28 +19,21 @@ function pickServiceFromModel(modelId = '') {
 }
 
 function normalizeContent(value) {
-  // OpenAI Chat Completions expects a string for `message.content`.
   if (value == null) return '';
   if (typeof value === 'string') return value;
-
-  // Some providers return an array of content parts (or plain list).
   if (Array.isArray(value)) {
     return value.map((p) => {
       if (p == null) return '';
       if (typeof p === 'string') return p;
       if (typeof p === 'object') {
-        // common shapes: {type:"text", text:"..."}, {text:"..."}, {content:"..."}
         if (typeof p.text === 'string') return p.text;
         if (typeof p.content === 'string') return p.content;
         if (typeof p.value === 'string') return p.value;
-        // fallback: stringify object part
         try { return JSON.stringify(p); } catch { return String(p); }
       }
       return String(p);
     }).join('');
   }
-
-  // Fallback: stringify objects/numbers/etc.
   try { return JSON.stringify(value); } catch { return String(value); }
 }
 
@@ -59,14 +50,15 @@ function writeSSE(res, obj) {
   res.write(`data: ${JSON.stringify(obj)}\n\n`);
 }
 
-async function callDriver({ puterToken, body }) {
-  let lastErr = null;
+async function callDriverWithToken({ token, body }) {
+  let last = null;
+
   for (const host of HOSTS) {
     try {
       const r = await fetch(host + DRIVER_PATH, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${puterToken}`,
+          'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
           'Accept': 'application/json',
           'Origin': 'https://puter.com'
@@ -78,25 +70,29 @@ async function callDriver({ puterToken, body }) {
       const json = ct.includes('application/json') ? await r.json() : null;
       const text = ct.includes('application/json') ? null : await r.text();
 
-      return { ok: r.ok, status: r.status, ct, json, text, host };
+      return { ok: r.ok, status: r.status, json, text, host };
     } catch (e) {
-      lastErr = e;
+      last = e;
     }
   }
-  throw lastErr || new Error('All upstream hosts failed');
+
+  throw last || new Error('All upstream hosts failed');
 }
 
 export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
+  // Dummy key gate (clients use this)
   const incomingKey = req.headers['authorization']?.replace('Bearer ', '');
   if (process.env.PROXY_API_KEY && incomingKey !== process.env.PROXY_API_KEY) {
     return res.status(401).json({ error: 'Invalid Proxy API Key' });
   }
 
-  const puterToken = process.env.PUTER_TOKEN;
-  if (!puterToken) return res.status(500).json({ error: 'Server misconfiguration: Missing PUTER_TOKEN' });
+  // Token pool (server side)
+  if (!hasAnyToken()) {
+    return res.status(500).json({ error: 'Server misconfiguration: Missing PUTER_TOKEN(S)' });
+  }
 
   const body = req.body || {};
   const { messages, model, temperature, max_tokens, tools } = body;
@@ -115,41 +111,89 @@ export default async function handler(req, res) {
     interface: 'puter-chat-completion',
     service: pickServiceFromModel(selectedModel),
     method: 'complete',
-    args: {
-      messages,
-      model: selectedModel,
-      stream: wantStream,
-      temperature,
-      max_tokens,
-      tools
-    }
+    args: { messages, model: selectedModel, stream: wantStream, temperature, max_tokens, tools }
   };
 
-  try {
-    const upstream = await callDriver({ puterToken, body: driverBody });
+  // Try up to N tokens on soft failures
+  const maxAttempts = Math.max(1, Number(process.env.PUTER_TOKEN_MAX_ATTEMPTS || 3));
 
-    if (upstream.json && typeof upstream.json === 'object' && upstream.json.success === false) {
-      const msg = upstream.json?.error?.message || JSON.stringify(upstream.json.error || upstream.json);
-      console.error('Upstream chat driver error:', upstream.host, msg);
-      return res.status(502).json({ error: { message: msg, type: 'upstream_error' } });
-    }
+  let lastErr = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const token = getToken();
+    if (!token) break;
 
-    const result = upstream.json?.result ?? upstream.json ?? upstream.text;
+    try {
+      const upstream = await callDriverWithToken({ token, body: driverBody });
 
-    // STREAMING (OpenAI SSE)
-    if (wantStream) {
-      sseHeaders(res);
+      // Driver-level error envelope
+      if (upstream.json && typeof upstream.json === 'object' && upstream.json.success === false) {
+        const msg = upstream.json?.error?.message || JSON.stringify(upstream.json.error || upstream.json);
+        reportTokenResult(token, { ok: false, status: 502, errorText: msg });
+        lastErr = { status: 502, msg, upstreamHost: upstream.host };
 
-      const created = Math.floor(Date.now() / 1000);
-      const idBase = 'chatcmpl-' + Date.now();
+        // retry next token on soft-ish errors
+        continue;
+      }
 
-      writeSSE(res, {
-        id: idBase,
-        object: 'chat.completion.chunk',
-        created,
-        model: selectedModel,
-        choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
-      });
+      // HTTP-level errors
+      if (!upstream.ok) {
+        const msg = upstream.text || JSON.stringify(upstream.json || {});
+        reportTokenResult(token, { ok: false, status: upstream.status, errorText: msg });
+        lastErr = { status: upstream.status, msg, upstreamHost: upstream.host };
+
+        // Retry next token only on typical transient statuses
+        if (upstream.status === 429 || (upstream.status >= 500 && upstream.status <= 599)) continue;
+        // For 401/403, token is likely bad; try next token
+        if (upstream.status === 401 || upstream.status === 403) continue;
+
+        return res.status(upstream.status).json({ error: { message: msg, type: 'upstream_error' } });
+      }
+
+      // success
+      reportTokenResult(token, { ok: true, status: 200 });
+
+      const result = upstream.json?.result ?? upstream.json ?? upstream.text;
+
+      if (wantStream) {
+        sseHeaders(res);
+        const created = Math.floor(Date.now() / 1000);
+        const idBase = 'chatcmpl-' + Date.now();
+
+        writeSSE(res, {
+          id: idBase,
+          object: 'chat.completion.chunk',
+          created,
+          model: selectedModel,
+          choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
+        });
+
+        const content = normalizeContent(
+          typeof result === 'string'
+            ? result
+            : (result?.message?.content ?? result?.content ?? result)
+        );
+
+        if (content) {
+          writeSSE(res, {
+            id: idBase,
+            object: 'chat.completion.chunk',
+            created,
+            model: selectedModel,
+            choices: [{ index: 0, delta: { content }, finish_reason: null }]
+          });
+        }
+
+        writeSSE(res, {
+          id: idBase,
+          object: 'chat.completion.chunk',
+          created,
+          model: selectedModel,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+        });
+
+        res.write('data: [DONE]\n\n');
+        return res.end();
+      }
 
       const content = normalizeContent(
         typeof result === 'string'
@@ -157,49 +201,27 @@ export default async function handler(req, res) {
           : (result?.message?.content ?? result?.content ?? result)
       );
 
-      if (content) {
-        writeSSE(res, {
-          id: idBase,
-          object: 'chat.completion.chunk',
-          created,
-          model: selectedModel,
-          choices: [{ index: 0, delta: { content }, finish_reason: null }]
-        });
-      }
-
-      writeSSE(res, {
-        id: idBase,
-        object: 'chat.completion.chunk',
-        created,
+      return res.status(200).json({
+        id: 'chatcmpl-' + Date.now(),
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
         model: selectedModel,
-        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content },
+          finish_reason: 'stop'
+        }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
       });
 
-      res.write('data: [DONE]\n\n');
-      return res.end();
+    } catch (e) {
+      lastErr = { status: 500, msg: String(e?.message || e) };
+      // mark token as transient fail
+      reportTokenResult(getToken(), { ok: false, status: 599, errorText: lastErr.msg });
+      continue;
     }
-
-    // NON-STREAM (JSON)
-    const content = normalizeContent(
-      typeof result === 'string'
-        ? result
-        : (result?.message?.content ?? result?.content ?? result)
-    );
-
-    return res.status(200).json({
-      id: 'chatcmpl-' + Date.now(),
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model: selectedModel,
-      choices: [{
-        index: 0,
-        message: { role: 'assistant', content },
-        finish_reason: 'stop'
-      }],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-    });
-  } catch (e) {
-    console.error('Proxy Error:', e);
-    return res.status(500).json({ error: { message: e?.message || 'Internal Proxy Error', type: 'server_error' } });
   }
+
+  const msg = lastErr?.msg || 'Upstream error (all tokens failed)';
+  return res.status(502).json({ error: { message: msg, type: 'upstream_error' } });
 }
