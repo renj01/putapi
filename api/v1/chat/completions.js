@@ -1,12 +1,27 @@
-// OpenAI-compatible Chat Completions -> Puter Drivers API + token rotation
-import { getToken, hasAnyToken, reportTokenResult } from '../../_lib/tokenPool.js';
+// Patch: OpenAI models on Puter sometimes require a different service name.
+// We map service "openai" -> "openai-completion" (configurable via env).
+// Drivers API: POST /drivers/call  citeturn1view0
 
 const DRIVER_PATH = '/drivers/call';
 const HOSTS = ['https://api.puter.com', 'https://puter.com'];
 
+function mapService(service) {
+  const s = (service || '').toLowerCase();
+
+  // Allow override
+  const override = process.env.PUTER_OPENAI_SERVICE;
+  if (override && s === 'openai') return override;
+
+  // Default mapping: many Puter installs register OpenAI driver as "openai-completion"
+  if (s === 'openai') return 'openai-completion';
+
+  return service;
+}
+
 function pickServiceFromModel(modelId = '') {
   const m = (modelId || '').toLowerCase();
   if (m.includes('/')) return m.split('/')[0];
+
   if (m.startsWith('claude')) return 'claude';
   if (m.startsWith('gemini')) return 'gemini';
   if (m.startsWith('grok') || m.startsWith('xai')) return 'xai';
@@ -15,6 +30,7 @@ function pickServiceFromModel(modelId = '') {
   if (m.startsWith('openrouter')) return 'openrouter';
   if (m.startsWith('qwen')) return 'qwen';
   if (m.startsWith('gpt')) return 'openai';
+
   return 'openai';
 }
 
@@ -37,22 +53,8 @@ function normalizeContent(value) {
   try { return JSON.stringify(value); } catch { return String(value); }
 }
 
-function sseHeaders(res) {
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-cache, no-transform',
-    'Connection': 'keep-alive',
-    'X-Accel-Buffering': 'no'
-  });
-}
-
-function writeSSE(res, obj) {
-  res.write(`data: ${JSON.stringify(obj)}\n\n`);
-}
-
-async function callDriverWithToken({ token, body }) {
-  let last = null;
-
+async function callDriver({ token, body }) {
+  let lastErr = null;
   for (const host of HOSTS) {
     try {
       const r = await fetch(host + DRIVER_PATH, {
@@ -69,30 +71,25 @@ async function callDriverWithToken({ token, body }) {
       const ct = (r.headers.get('content-type') || '').toLowerCase();
       const json = ct.includes('application/json') ? await r.json() : null;
       const text = ct.includes('application/json') ? null : await r.text();
-
       return { ok: r.ok, status: r.status, json, text, host };
     } catch (e) {
-      last = e;
+      lastErr = e;
     }
   }
-
-  throw last || new Error('All upstream hosts failed');
+  throw lastErr || new Error('All upstream hosts failed');
 }
 
 export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  // Dummy key gate (clients use this)
   const incomingKey = req.headers['authorization']?.replace('Bearer ', '');
   if (process.env.PROXY_API_KEY && incomingKey !== process.env.PROXY_API_KEY) {
     return res.status(401).json({ error: 'Invalid Proxy API Key' });
   }
 
-  // Token pool (server side)
-  if (!hasAnyToken()) {
-    return res.status(500).json({ error: 'Server misconfiguration: Missing PUTER_TOKEN(S)' });
-  }
+  const puterToken = process.env.PUTER_TOKEN;
+  if (!puterToken) return res.status(500).json({ error: 'Server misconfiguration: Missing PUTER_TOKEN' });
 
   const body = req.body || {};
   const { messages, model, temperature, max_tokens, tools } = body;
@@ -103,125 +100,48 @@ export default async function handler(req, res) {
 
   const selectedModel = model || 'gpt-5-nano';
 
-  // Only stream when stream is strictly true AND client accepts SSE
-  const accept = (req.headers['accept'] || '').toLowerCase();
-  const wantStream = (body.stream === true) && accept.includes('text/event-stream');
+  const picked = pickServiceFromModel(selectedModel);
+  const service = mapService(picked);
 
   const driverBody = {
     interface: 'puter-chat-completion',
-    service: pickServiceFromModel(selectedModel),
+    service,
     method: 'complete',
-    args: { messages, model: selectedModel, stream: wantStream, temperature, max_tokens, tools }
+    args: { messages, model: selectedModel, stream: false, temperature, max_tokens, tools }
   };
 
-  // Try up to N tokens on soft failures
-  const maxAttempts = Math.max(1, Number(process.env.PUTER_TOKEN_MAX_ATTEMPTS || 3));
+  const upstream = await callDriver({ token: puterToken, body: driverBody });
 
-  let lastErr = null;
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const token = getToken();
-    if (!token) break;
-
-    try {
-      const upstream = await callDriverWithToken({ token, body: driverBody });
-
-      // Driver-level error envelope
-      if (upstream.json && typeof upstream.json === 'object' && upstream.json.success === false) {
-        const msg = upstream.json?.error?.message || JSON.stringify(upstream.json.error || upstream.json);
-        reportTokenResult(token, { ok: false, status: 502, errorText: msg });
-        lastErr = { status: 502, msg, upstreamHost: upstream.host };
-
-        // retry next token on soft-ish errors
-        continue;
-      }
-
-      // HTTP-level errors
-      if (!upstream.ok) {
-        const msg = upstream.text || JSON.stringify(upstream.json || {});
-        reportTokenResult(token, { ok: false, status: upstream.status, errorText: msg });
-        lastErr = { status: upstream.status, msg, upstreamHost: upstream.host };
-
-        // Retry next token only on typical transient statuses
-        if (upstream.status === 429 || (upstream.status >= 500 && upstream.status <= 599)) continue;
-        // For 401/403, token is likely bad; try next token
-        if (upstream.status === 401 || upstream.status === 403) continue;
-
-        return res.status(upstream.status).json({ error: { message: msg, type: 'upstream_error' } });
-      }
-
-      // success
-      reportTokenResult(token, { ok: true, status: 200 });
-
-      const result = upstream.json?.result ?? upstream.json ?? upstream.text;
-
-      if (wantStream) {
-        sseHeaders(res);
-        const created = Math.floor(Date.now() / 1000);
-        const idBase = 'chatcmpl-' + Date.now();
-
-        writeSSE(res, {
-          id: idBase,
-          object: 'chat.completion.chunk',
-          created,
-          model: selectedModel,
-          choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
-        });
-
-        const content = normalizeContent(
-          typeof result === 'string'
-            ? result
-            : (result?.message?.content ?? result?.content ?? result)
-        );
-
-        if (content) {
-          writeSSE(res, {
-            id: idBase,
-            object: 'chat.completion.chunk',
-            created,
-            model: selectedModel,
-            choices: [{ index: 0, delta: { content }, finish_reason: null }]
-          });
-        }
-
-        writeSSE(res, {
-          id: idBase,
-          object: 'chat.completion.chunk',
-          created,
-          model: selectedModel,
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
-        });
-
-        res.write('data: [DONE]\n\n');
-        return res.end();
-      }
-
-      const content = normalizeContent(
-        typeof result === 'string'
-          ? result
-          : (result?.message?.content ?? result?.content ?? result)
-      );
-
-      return res.status(200).json({
-        id: 'chatcmpl-' + Date.now(),
-        object: 'chat.completion',
-        created: Math.floor(Date.now() / 1000),
-        model: selectedModel,
-        choices: [{
-          index: 0,
-          message: { role: 'assistant', content },
-          finish_reason: 'stop'
-        }],
-        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-      });
-
-    } catch (e) {
-      lastErr = { status: 500, msg: String(e?.message || e) };
-      // mark token as transient fail
-      reportTokenResult(getToken(), { ok: false, status: 599, errorText: lastErr.msg });
-      continue;
-    }
+  // Driver envelope errors always come back 200 with success:false per docs citeturn1view0
+  if (upstream.json && typeof upstream.json === 'object' && upstream.json.success === false) {
+    const msg = upstream.json?.error?.message || JSON.stringify(upstream.json.error || upstream.json);
+    console.error('Upstream chat driver error:', upstream.host, msg);
+    return res.status(502).json({ error: { message: msg, type: 'upstream_error' } });
   }
 
-  const msg = lastErr?.msg || 'Upstream error (all tokens failed)';
-  return res.status(502).json({ error: { message: msg, type: 'upstream_error' } });
+  if (!upstream.ok) {
+    const msg = upstream.text || JSON.stringify(upstream.json || {});
+    console.error('Upstream HTTP error:', upstream.host, upstream.status, msg);
+    return res.status(upstream.status).json({ error: { message: msg, type: 'upstream_error' } });
+  }
+
+  const result = upstream.json?.result ?? upstream.json ?? upstream.text;
+  const content = normalizeContent(
+    typeof result === 'string'
+      ? result
+      : (result?.message?.content ?? result?.content ?? result)
+  );
+
+  return res.status(200).json({
+    id: 'chatcmpl-' + Date.now(),
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: selectedModel,
+    choices: [{
+      index: 0,
+      message: { role: 'assistant', content },
+      finish_reason: 'stop'
+    }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+  });
 }
