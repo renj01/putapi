@@ -1,11 +1,13 @@
 // Chat Completions (CommonJS) + PUTER_TOKENS rotation
-// Patch: handle "No implementation available for interface `puter-chat-completion`"
-// - Retry next token on that error
-// - Fallback to legacy interface/method: interface 'puter.ai', method 'chat' (still via /drivers/call)
+// Patch: Puter web_search tool support (OpenAI models only) + safe filtering.
 //
-// Also includes:
-// - openai service mapping -> openai-completion (env override)
-// - omit temperature for openai by default (env override)
+// Blog announcement: web search is now available in puter.ai.chat for OpenAI models (tools: [{type:"web_search"}]).
+// Docs also say Web Search is specific to OpenAI models.
+//
+// Behavior:
+// - If tools include {type:"web_search"} => only forward to OpenAI models (openai/* or gpt*)
+// - For non-OpenAI models, web_search is stripped to avoid upstream errors.
+// - Keeps: interface fallback + openai service mapping + omit temperature for openai by default.
 
 const { hasAnyToken, getToken, reportTokenResult } = require('./tokenPool');
 
@@ -47,6 +49,21 @@ function normalizeContent(value) {
 
 function isNoImplError(msg) {
   return typeof msg === 'string' && msg.includes('No implementation available for interface `puter-chat-completion`');
+}
+
+function sanitizeTools(tools, baseService) {
+  if (!Array.isArray(tools)) return undefined;
+
+  const hasWebSearch = tools.some(t => t && String(t.type).toLowerCase() === 'web_search');
+  if (!hasWebSearch) return tools;
+
+  // Only OpenAI models support web_search (per Puter docs/blog). Strip it otherwise.
+  if (baseService !== 'openai') {
+    const filtered = tools.filter(t => !(t && String(t.type).toLowerCase() === 'web_search'));
+    return filtered.length ? filtered : undefined;
+  }
+
+  return tools;
 }
 
 async function callDriver({ token, body }) {
@@ -96,12 +113,15 @@ module.exports = async function handler(req, res) {
   const baseService = pickServiceFromModel(selectedModel);
   const service = mapOpenAIService(baseService);
 
+  const safeTools = sanitizeTools(tools, baseService);
+
   // Build args; omit temperature for openai unless forced
-  const args = { messages, model: selectedModel, stream: false, max_tokens, tools };
+  const args = { messages, model: selectedModel, stream: false, max_tokens };
+  if (safeTools) args.tools = safeTools;
+
   const allowTemp = baseService !== 'openai' || process.env.PUTER_OPENAI_ALLOW_TEMPERATURE === 'true';
   if (allowTemp && typeof temperature === 'number') args.temperature = temperature;
 
-  // Primary driver payload
   const driverBody = {
     interface: 'puter-chat-completion',
     service,
@@ -109,20 +129,18 @@ module.exports = async function handler(req, res) {
     args
   };
 
-  // Legacy fallback payload (some Puter deployments expose only puter.ai/chat)
+  const legacyOpts = {
+    model: selectedModel,
+    stream: false,
+    ...(typeof max_tokens === 'number' ? { max_tokens } : {}),
+    ...(safeTools ? { tools: safeTools } : {}),
+    ...(allowTemp && typeof temperature === 'number' ? { temperature } : {}),
+  };
+
   const legacyBody = {
     interface: 'puter.ai',
     method: 'chat',
-    args: [
-      messages,
-      {
-        model: selectedModel,
-        stream: false,
-        ...(allowTemp && typeof temperature === 'number' ? { temperature } : {}),
-        ...(typeof max_tokens === 'number' ? { max_tokens } : {}),
-        ...(tools ? { tools } : {})
-      }
-    ]
+    args: [messages, legacyOpts]
   };
 
   const maxAttempts = Math.max(1, Number(process.env.PUTER_TOKEN_MAX_ATTEMPTS || 3));
@@ -133,15 +151,12 @@ module.exports = async function handler(req, res) {
     if (!token) break;
 
     try {
-      // 1) try primary
       let upstream = await callDriver({ token, body: driverBody });
 
-      // Driver envelope error?
       if (upstream.json && typeof upstream.json === 'object' && upstream.json.success === false) {
         const msg = upstream.json?.error?.message || JSON.stringify(upstream.json.error || upstream.json);
         lastMsg = msg;
 
-        // If it's the "no implementation" error, try legacy once for this token
         if (isNoImplError(msg)) {
           upstream = await callDriver({ token, body: legacyBody });
 
@@ -149,17 +164,14 @@ module.exports = async function handler(req, res) {
             const msg2 = upstream.json?.error?.message || JSON.stringify(upstream.json.error || upstream.json);
             lastMsg = msg2;
             reportTokenResult(token, { ok: false, status: 502 });
-            // retry next token
             continue;
           }
         } else {
           reportTokenResult(token, { ok: false, status: 502 });
-          // retry next token
           continue;
         }
       }
 
-      // HTTP error?
       if (!upstream.ok) {
         const msg = upstream.text || JSON.stringify(upstream.json || {});
         lastMsg = msg;
