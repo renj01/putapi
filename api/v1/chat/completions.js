@@ -14,8 +14,13 @@ function sseHeaders(res) {
 }
 
 function writeSSE(res, obj) {
-  // OpenAI style SSE: each message is `data: <json>\n\n`
   res.write(`data: ${JSON.stringify(obj)}\n\n`);
+}
+
+async function readUpstreamBodySafe(upstream) {
+  // Avoid throwing on non-UTF8 / huge bodies; cap at ~64KB
+  const txt = await upstream.text();
+  return txt.length > 65536 ? (txt.slice(0, 65536) + '\n...[truncated]') : txt;
 }
 
 export default async function handler(req, res) {
@@ -35,19 +40,12 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: 'Server misconfiguration: Missing PUTER_TOKEN' });
   }
 
-  const {
-    messages,
-    model,
-    stream,
-    temperature,
-    max_tokens,
-    tools
-  } = req.body || {};
+  const body = req.body || {};
+  const { messages, model, stream, temperature, max_tokens, tools } = body;
 
   const selectedModel = model || 'gpt-5-nano';
   const wantStream = !!stream;
 
-  // OpenAI-compatible request validation (minimal)
   if (!Array.isArray(messages)) {
     return res.status(400).json({ error: 'Invalid request: messages must be an array' });
   }
@@ -86,11 +84,16 @@ export default async function handler(req, res) {
     });
 
     if (!upstream.ok) {
-      const txt = await upstream.text();
-      return res.status(502).json({
+      const upstreamBody = await readUpstreamBodySafe(upstream);
+      // Important: log this so Vercel logs show the real reason (401/403/429/etc.)
+      console.error('Upstream chat error:', upstream.status, upstreamBody);
+
+      // Pass through the upstream status code so you can see the real failure in the client
+      return res.status(upstream.status).json({
         error: {
-          message: `Puter API Error: ${upstream.status} - ${txt}`,
-          type: 'upstream_error'
+          message: upstreamBody || `Upstream error: ${upstream.status}`,
+          type: 'upstream_error',
+          upstream_status: upstream.status
         }
       });
     }
@@ -102,7 +105,7 @@ export default async function handler(req, res) {
       const created = Math.floor(Date.now() / 1000);
       const idBase = 'chatcmpl-' + Date.now();
 
-      // Send an initial chunk (many clients expect at least one delta event quickly)
+      // initial role chunk
       writeSSE(res, {
         id: idBase,
         object: 'chat.completion.chunk',
@@ -114,10 +117,6 @@ export default async function handler(req, res) {
       const reader = upstream.body.getReader();
       const decoder = new TextDecoder();
 
-      // We assume Puter returns a byte stream of text (or JSON-ish lines).
-      // We forward decoded text as incremental deltas. This matches OpenAI SSE expectations:
-      // - each "data: {...}\n\n" contains a chat.completion.chunk
-      // - final message is "data: [DONE]\n\n"
       while (!clientGone) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -134,7 +133,7 @@ export default async function handler(req, res) {
         });
       }
 
-      // Close out stream
+      // final chunk + DONE
       writeSSE(res, {
         id: idBase,
         object: 'chat.completion.chunk',
@@ -148,7 +147,16 @@ export default async function handler(req, res) {
     }
 
     // 5) Non-stream response
-    const data = await upstream.json();
+    const contentType = (upstream.headers.get('content-type') || '').toLowerCase();
+    let data;
+
+    if (contentType.includes('application/json')) {
+      data = await upstream.json();
+    } else {
+      // If upstream returns text, do not crash; wrap it
+      const txt = await upstream.text();
+      data = { message: { role: 'assistant', content: txt } };
+    }
 
     const content =
       typeof data === 'string'
