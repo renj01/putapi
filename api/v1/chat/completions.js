@@ -1,9 +1,6 @@
 // OpenAI-compatible Chat Completions -> Puter Drivers API
-// Fix: prevent clients that expect JSON from receiving SSE accidentally.
-//
-// Key changes:
-// - Only stream when req.body.stream === true (strict boolean)
-// - Also require client Accept header includes text/event-stream for SSE
+// Patch: normalize non-string content (some upstreams return content as an array/list of parts).
+// Also prevents SSE from being sent to JSON-only clients.
 //
 // Drivers API: POST /drivers/call
 const DRIVER_PATH = '/drivers/call';
@@ -21,6 +18,32 @@ function pickServiceFromModel(modelId = '') {
   if (m.startsWith('qwen')) return 'qwen';
   if (m.startsWith('gpt')) return 'openai';
   return 'openai';
+}
+
+function normalizeContent(value) {
+  // OpenAI Chat Completions expects a string for `message.content`.
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+
+  // Some providers return an array of content parts (or plain list).
+  if (Array.isArray(value)) {
+    return value.map((p) => {
+      if (p == null) return '';
+      if (typeof p === 'string') return p;
+      if (typeof p === 'object') {
+        // common shapes: {type:"text", text:"..."}, {text:"..."}, {content:"..."}
+        if (typeof p.text === 'string') return p.text;
+        if (typeof p.content === 'string') return p.content;
+        if (typeof p.value === 'string') return p.value;
+        // fallback: stringify object part
+        try { return JSON.stringify(p); } catch { return String(p); }
+      }
+      return String(p);
+    }).join('');
+  }
+
+  // Fallback: stringify objects/numbers/etc.
+  try { return JSON.stringify(value); } catch { return String(value); }
 }
 
 function sseHeaders(res) {
@@ -84,7 +107,7 @@ export default async function handler(req, res) {
 
   const selectedModel = model || 'gpt-5-nano';
 
-  // IMPORTANT: Only stream if stream is strictly boolean true AND client accepts SSE.
+  // Only stream when stream is strictly true AND client accepts SSE
   const accept = (req.headers['accept'] || '').toLowerCase();
   const wantStream = (body.stream === true) && accept.includes('text/event-stream');
 
@@ -111,6 +134,8 @@ export default async function handler(req, res) {
       return res.status(502).json({ error: { message: msg, type: 'upstream_error' } });
     }
 
+    const result = upstream.json?.result ?? upstream.json ?? upstream.text;
+
     // STREAMING (OpenAI SSE)
     if (wantStream) {
       sseHeaders(res);
@@ -126,12 +151,11 @@ export default async function handler(req, res) {
         choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
       });
 
-      // If upstream is not actually streaming bytes, we still emit a single content chunk.
-      const result = upstream.json?.result ?? upstream.json ?? upstream.text;
-      const content =
+      const content = normalizeContent(
         typeof result === 'string'
           ? result
-          : (result?.message?.content ?? result?.content ?? '');
+          : (result?.message?.content ?? result?.content ?? result)
+      );
 
       if (content) {
         writeSSE(res, {
@@ -155,12 +179,12 @@ export default async function handler(req, res) {
       return res.end();
     }
 
-    // NON-STREAM (JSON) — always return valid JSON (no "data:" lines)
-    const result = upstream.json?.result ?? upstream.json ?? upstream.text;
-    const content =
+    // NON-STREAM (JSON)
+    const content = normalizeContent(
       typeof result === 'string'
         ? result
-        : (result?.message?.content ?? result?.content ?? '');
+        : (result?.message?.content ?? result?.content ?? result)
+    );
 
     return res.status(200).json({
       id: 'chatcmpl-' + Date.now(),
