@@ -1,28 +1,79 @@
-let cache = { ts: 0, data: null };
+let cache = new Map(); // key -> {ts, data}
 const CACHE_MS = 10 * 60 * 1000; // 10 minutes
+
 const PUTER_MODELS_URL = 'https://puter.com/puterai/chat/models/details';
+
+function toArray(raw) {
+  // The public endpoint shape can vary. Normalize to an array of model objects.
+  if (Array.isArray(raw)) return raw;
+
+  if (raw && typeof raw === 'object') {
+    if (Array.isArray(raw.models)) return raw.models;
+    if (Array.isArray(raw.data)) return raw.data;
+    if (Array.isArray(raw.results)) return raw.results;
+
+    // Sometimes providers are grouped in an object
+    // e.g. { providers: { openai: [...], anthropic: [...] } }
+    if (raw.providers && typeof raw.providers === 'object') {
+      const all = [];
+      for (const v of Object.values(raw.providers)) {
+        if (Array.isArray(v)) all.push(...v);
+        else if (v && typeof v === 'object') {
+          if (Array.isArray(v.models)) all.push(...v.models);
+          else if (Array.isArray(v.data)) all.push(...v.data);
+        }
+      }
+      if (all.length) return all;
+    }
+
+    // Or the root object is provider -> models array
+    // e.g. { openai: [...], anthropic: [...] }
+    const all = [];
+    for (const [k, v] of Object.entries(raw)) {
+      if (Array.isArray(v)) all.push(...v);
+      else if (v && typeof v === 'object') {
+        if (Array.isArray(v.models)) all.push(...v.models);
+        else if (Array.isArray(v.data)) all.push(...v.data);
+      }
+    }
+    if (all.length) return all;
+  }
+
+  return null;
+}
 
 function normalizeToOpenAI(models) {
   const created = Math.floor(Date.now() / 1000);
 
-  // OpenAI /v1/models expects: {object:"list", data:[{id,object,created,owned_by}, ...]}
-  // We map Puter `provider` to `owned_by`. We also expose both forms of ids:
-  // - If Puter returns provider-prefixed aliases, keep exact `id` so it works when passed back to Puter.
-  return models.map((m) => ({
-    id: m.id,
-    object: 'model',
-    created,
-    owned_by: m.provider || 'puter',
-    // Non-standard extras (harmless for most clients)
-    ...(m.name ? { name: m.name } : {}),
-    ...(m.context ? { context_length: m.context } : {}),
-    ...(m.max_tokens ? { max_output_tokens: m.max_tokens } : {}),
-    ...(m.aliases ? { aliases: m.aliases } : {})
-  }));
+  return models
+    .filter(Boolean)
+    .map((m) => {
+      // Try common field names from various model registries
+      const id =
+        m.id ||
+        m.model ||
+        m.slug ||
+        m.name ||
+        m.model_id;
+
+      const provider =
+        m.provider ||
+        m.owned_by ||
+        (typeof id === 'string' && id.includes('/') ? id.split('/')[0] : null) ||
+        'puter';
+
+      return {
+        id,
+        object: 'model',
+        created,
+        owned_by: provider
+      };
+    })
+    // drop invalid
+    .filter((m) => typeof m.id === 'string' && m.id.length > 0);
 }
 
 export default async function handler(req, res) {
-  // CORS preflight
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
@@ -33,51 +84,69 @@ export default async function handler(req, res) {
   // }
 
   try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const provider = url.searchParams.get('provider'); // matches puter.ai.listModels(provider)
+    const cacheKey = provider || '__all__';
+
     const now = Date.now();
-    if (cache.data && (now - cache.ts) < CACHE_MS) {
-      return res.status(200).json({ object: 'list', data: cache.data });
+    const cached = cache.get(cacheKey);
+    if (cached && (now - cached.ts) < CACHE_MS) {
+      return res.status(200).json({ object: 'list', data: cached.data });
     }
 
-    // Public endpoint described in Puter docs:
-    // "pulled from the same source as the public /puterai/chat/models/details endpoint"
-    const r = await fetch(PUTER_MODELS_URL, {
+    const upstreamUrl = provider
+      ? `${PUTER_MODELS_URL}?provider=${encodeURIComponent(provider)}`
+      : PUTER_MODELS_URL;
+
+    const r = await fetch(upstreamUrl, {
       headers: {
         'Accept': 'application/json',
-        // Some Puter endpoints behave better with an Origin header
         'Origin': 'https://puter.com'
       }
     });
+
+    // If we got HTML (cloudflare, WAF, etc.), this will fail in json() below
+    const contentType = (r.headers.get('content-type') || '').toLowerCase();
 
     if (!r.ok) {
       const txt = await r.text();
       throw new Error(`Failed to fetch models: ${r.status} - ${txt}`);
     }
 
-    const raw = await r.json();
-
-    // The endpoint typically returns an array of model objects
-    if (!Array.isArray(raw)) {
-      throw new Error('Models endpoint returned unexpected shape (expected array).');
+    let raw;
+    if (contentType.includes('application/json')) {
+      raw = await r.json();
+    } else {
+      // Best-effort: try parse as JSON anyway; otherwise error out
+      const txt = await r.text();
+      try {
+        raw = JSON.parse(txt);
+      } catch {
+        throw new Error(`Models endpoint returned non-JSON content-type: ${contentType || 'unknown'}`);
+      }
     }
 
-    const openaiModels = normalizeToOpenAI(raw);
+    const arr = toArray(raw);
+    if (!arr) {
+      // Log a small hint to Vercel logs (won't leak huge payloads)
+      const hint = typeof raw === 'object' ? Object.keys(raw).slice(0, 20).join(',') : String(raw).slice(0, 200);
+      throw new Error(`Models endpoint returned unexpected shape. Keys/preview: ${hint}`);
+    }
 
-    cache = { ts: now, data: openaiModels };
+    const openaiModels = normalizeToOpenAI(arr);
+    cache.set(cacheKey, { ts: now, data: openaiModels });
 
-    return res.status(200).json({
-      object: 'list',
-      data: openaiModels
-    });
+    return res.status(200).json({ object: 'list', data: openaiModels });
   } catch (error) {
     console.error('Models Error:', error);
 
-    // Safe fallback (minimal) so clients still work if upstream is down
+    // Fallback minimal list so clients still work if upstream is down
     const created = Math.floor(Date.now() / 1000);
     return res.status(200).json({
       object: 'list',
       data: [
         { id: 'gpt-5-nano', object: 'model', created, owned_by: 'puter' },
-        { id: 'gpt-4o', object: 'model', created, owned_by: 'openai' }
+        { id: 'openai/gpt-4o', object: 'model', created, owned_by: 'openai' }
       ],
       warning: 'Upstream model list unavailable; returned fallback list.'
     });
