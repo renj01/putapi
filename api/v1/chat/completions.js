@@ -1,16 +1,24 @@
-// Chat Completions (CommonJS) + PUTER_TOKENS rotation + Streaming (OpenAI SSE)
-// Supports:
-// - Non-stream JSON responses (OpenAI-compatible)
-// - stream=true with Accept: text/event-stream (OpenAI SSE compatible)
-// - Puter web_search (OpenAI models) routed through legacy puter.ai/chat (best compatibility)
-// - Fallback to legacy when puter-chat-completion is missing
-// - openai -> openai-completion service mapping
-// - omit temperature for openai unless forced (PUTER_OPENAI_ALLOW_TEMPERATURE=true)
+// Chat Completions (CommonJS) + PUTER_TOKENS rotation + Streaming (OpenAI SSE) + Heartbeats
+//
+// Fix for Zeabur/Open WebUI 504 timeouts:
+// - Send an immediate SSE "heartbeat" chunk after headers (flushes bytes ASAP)
+// - Send periodic SSE comments (": keep-alive") every HEARTBEAT_MS while streaming
+//
+// Features kept:
+// - web_search (OpenAI models) routed through legacy puter.ai/chat
+// - fallback to legacy when puter-chat-completion is missing
+// - openai -> openai-completion mapping
+// - omit temperature for openai unless forced
+//
+// Env (optional):
+// - SSE_HEARTBEAT_MS (default 8000)
 
 const { hasAnyToken, getToken, reportTokenResult } = require('./tokenPool');
 
 const DRIVER_PATH = '/drivers/call';
 const HOSTS = ['https://api.puter.com', 'https://puter.com'];
+
+const HEARTBEAT_MS = Math.max(3000, Number(process.env.SSE_HEARTBEAT_MS || 8000));
 
 function mapOpenAIService(service) {
   if (service !== 'openai') return service;
@@ -58,7 +66,6 @@ function sanitizeTools(tools, baseService) {
   const hasWS = hasWebSearchTool(tools);
   if (!hasWS) return tools;
 
-  // web_search is specific to OpenAI models; strip otherwise
   if (baseService !== 'openai') {
     const filtered = tools.filter(t => !(t && String(t.type).toLowerCase() === 'web_search'));
     return filtered.length ? filtered : undefined;
@@ -77,6 +84,21 @@ function sseHeaders(res) {
 
 function writeSSE(res, obj) {
   res.write(`data: ${JSON.stringify(obj)}\n\n`);
+}
+
+function writeSSEComment(res, comment) {
+  // SSE comment frames are valid keep-alive signals
+  res.write(`: ${comment || 'keep-alive'}\n\n`);
+}
+
+function startHeartbeat(res) {
+  // Send periodic SSE comments to keep the connection alive through proxies
+  const t = setInterval(() => {
+    try { writeSSEComment(res, 'keep-alive'); } catch {}
+  }, HEARTBEAT_MS);
+  // Don’t keep event loop alive (serverless friendliness)
+  t.unref?.();
+  return t;
 }
 
 async function fetchUpstream({ token, body }) {
@@ -115,13 +137,16 @@ function isRetryableStatus(status) {
   return status === 401 || status === 403 || status === 429 || (status >= 500 && status <= 599) || status === 599;
 }
 
-async function handleStreamFromUpstream({ upstreamResponse, res, selectedModel }) {
+async function streamAsOpenAI({ upstreamResponse, res, selectedModel }) {
   sseHeaders(res);
 
   const created = Math.floor(Date.now() / 1000);
   const idBase = 'chatcmpl-' + Date.now();
 
-  // initial role chunk
+  // **Immediate flush** to avoid gateway timeouts:
+  // 1) comment frame (tiny bytes)
+  writeSSEComment(res, 'init');
+  // 2) minimal valid OpenAI chunk
   writeSSE(res, {
     id: idBase,
     object: 'chat.completion.chunk',
@@ -130,10 +155,14 @@ async function handleStreamFromUpstream({ upstreamResponse, res, selectedModel }
     choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
   });
 
+  // Periodic keep-alives
+  const hb = startHeartbeat(res);
+
   const reader = upstreamResponse.body?.getReader?.();
   const decoder = new TextDecoder();
 
   if (!reader) {
+    clearInterval(hb);
     writeSSE(res, {
       id: idBase,
       object: 'chat.completion.chunk',
@@ -146,70 +175,78 @@ async function handleStreamFromUpstream({ upstreamResponse, res, selectedModel }
   }
 
   let buf = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
 
-    let idx;
-    while ((idx = buf.indexOf('\n')) !== -1) {
-      const rawLine = buf.slice(0, idx);
-      buf = buf.slice(idx + 1);
+      let idx;
+      while ((idx = buf.indexOf('\n')) !== -1) {
+        const rawLine = buf.slice(0, idx);
+        buf = buf.slice(idx + 1);
 
-      const line = rawLine.trimEnd();
-      if (!line) continue;
+        const line = rawLine.trimEnd();
+        if (!line) continue;
 
-      if (line.startsWith('data:')) {
-        const payload = line.slice(5).trim();
-        if (payload === '[DONE]') {
+        if (line.startsWith('data:')) {
+          const payload = line.slice(5).trim();
+          if (payload === '[DONE]') {
+            break;
+          }
+
+          let text = null;
+          try {
+            const j = JSON.parse(payload);
+            text =
+              j?.choices?.[0]?.delta?.content ??
+              j?.choices?.[0]?.message?.content ??
+              j?.message?.content ??
+              j?.content ??
+              null;
+
+            if (text == null && typeof j === 'string') text = j;
+            if (text == null) text = payload;
+          } catch {
+            text = payload;
+          }
+
+          if (text) {
+            writeSSE(res, {
+              id: idBase,
+              object: 'chat.completion.chunk',
+              created,
+              model: selectedModel,
+              choices: [{ index: 0, delta: { content: String(text) }, finish_reason: null }]
+            });
+          }
+        } else {
+          // Non-SSE line; stream as content
           writeSSE(res, {
             id: idBase,
             object: 'chat.completion.chunk',
             created,
             model: selectedModel,
-            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
-          });
-          res.write('data: [DONE]\n\n');
-          return res.end();
-        }
-
-        let text = null;
-        try {
-          const j = JSON.parse(payload);
-          text =
-            j?.choices?.[0]?.delta?.content ??
-            j?.choices?.[0]?.message?.content ??
-            j?.message?.content ??
-            j?.content ??
-            null;
-
-          if (text == null && typeof j === 'string') text = j;
-          if (text == null) text = payload;
-        } catch {
-          text = payload;
-        }
-
-        if (text) {
-          writeSSE(res, {
-            id: idBase,
-            object: 'chat.completion.chunk',
-            created,
-            model: selectedModel,
-            choices: [{ index: 0, delta: { content: String(text) }, finish_reason: null }]
+            choices: [{ index: 0, delta: { content: line + '\n' }, finish_reason: null }]
           });
         }
-      } else {
+      }
+
+      // If upstream isn't line-based, flush periodically to avoid buffering forever
+      if (buf.length > 2048 && !buf.includes('\n')) {
         writeSSE(res, {
           id: idBase,
           object: 'chat.completion.chunk',
           created,
           model: selectedModel,
-          choices: [{ index: 0, delta: { content: line + '\n' }, finish_reason: null }]
+          choices: [{ index: 0, delta: { content: buf }, finish_reason: null }]
         });
+        buf = '';
       }
     }
 
-    if (buf.length > 2048 && !buf.includes('\n')) {
+    // Flush any remainder
+    if (buf) {
       writeSSE(res, {
         id: idBase,
         object: 'chat.completion.chunk',
@@ -217,29 +254,20 @@ async function handleStreamFromUpstream({ upstreamResponse, res, selectedModel }
         model: selectedModel,
         choices: [{ index: 0, delta: { content: buf }, finish_reason: null }]
       });
-      buf = '';
     }
-  }
 
-  if (buf) {
     writeSSE(res, {
       id: idBase,
       object: 'chat.completion.chunk',
       created,
       model: selectedModel,
-      choices: [{ index: 0, delta: { content: buf }, finish_reason: null }]
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
     });
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } finally {
+    clearInterval(hb);
   }
-
-  writeSSE(res, {
-    id: idBase,
-    object: 'chat.completion.chunk',
-    created,
-    model: selectedModel,
-    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
-  });
-  res.write('data: [DONE]\n\n');
-  return res.end();
 }
 
 module.exports = async function handler(req, res) {
@@ -295,13 +323,13 @@ module.exports = async function handler(req, res) {
     if (!token) break;
 
     try {
-      // Web search: legacy FIRST
+      // Web search: legacy FIRST (best compatibility)
       if (wantWebSearch) {
         const { response: r } = await fetchUpstream({ token, body: legacyBody });
 
         if (wantStream && r.ok && r.body) {
           reportTokenResult(token, { ok: true, status: 200 });
-          return await handleStreamFromUpstream({ upstreamResponse: r, res, selectedModel });
+          return await streamAsOpenAI({ upstreamResponse: r, res, selectedModel });
         }
 
         const j = await readJsonSafe(r);
@@ -321,8 +349,8 @@ module.exports = async function handler(req, res) {
 
         const result = j?.result ?? j ?? await readTextSafe(r);
         reportTokenResult(token, { ok: true, status: 200 });
-
         const content = normalizeContent(result?.message?.content ?? result?.content ?? result);
+
         return res.status(200).json({
           id: 'chatcmpl-' + Date.now(),
           object: 'chat.completion',
@@ -333,12 +361,12 @@ module.exports = async function handler(req, res) {
         });
       }
 
-      // Primary
+      // Primary interface
       const { response: r1 } = await fetchUpstream({ token, body: primaryBody });
 
       if (wantStream && r1.ok && r1.body) {
         reportTokenResult(token, { ok: true, status: 200 });
-        return await handleStreamFromUpstream({ upstreamResponse: r1, res, selectedModel });
+        return await streamAsOpenAI({ upstreamResponse: r1, res, selectedModel });
       }
 
       const j1 = await readJsonSafe(r1);
@@ -347,12 +375,13 @@ module.exports = async function handler(req, res) {
         lastMsg = msg; lastStatus = 502;
         reportTokenResult(token, { ok: false, status: 502 });
 
+        // If no-implementation -> try legacy once
         if (isNoImplError(msg)) {
           const { response: r2 } = await fetchUpstream({ token, body: legacyBody });
 
           if (wantStream && r2.ok && r2.body) {
             reportTokenResult(token, { ok: true, status: 200 });
-            return await handleStreamFromUpstream({ upstreamResponse: r2, res, selectedModel });
+            return await streamAsOpenAI({ upstreamResponse: r2, res, selectedModel });
           }
 
           const j2 = await readJsonSafe(r2);
@@ -373,6 +402,7 @@ module.exports = async function handler(req, res) {
           const result2 = j2?.result ?? j2 ?? await readTextSafe(r2);
           reportTokenResult(token, { ok: true, status: 200 });
           const content2 = normalizeContent(result2?.message?.content ?? result2?.content ?? result2);
+
           return res.status(200).json({
             id: 'chatcmpl-' + Date.now(),
             object: 'chat.completion',
