@@ -1,6 +1,5 @@
-// Chat Completions + token rotation
-// FIX: correct import path (must reach api/_lib from api/v1/chat)
-import { getToken, hasAnyToken, reportTokenResult } from '../../../_lib/tokenPool.js';
+// Chat Completions (CommonJS) + PUTER_TOKENS rotation
+const { hasAnyToken, getToken, reportTokenResult } = require('./tokenPool');
 
 const DRIVER_PATH = '/drivers/call';
 const HOSTS = ['https://api.puter.com', 'https://puter.com'];
@@ -22,7 +21,14 @@ function pickServiceFromModel(modelId = '') {
 function normalizeContent(value) {
   if (value == null) return '';
   if (typeof value === 'string') return value;
-  if (Array.isArray(value)) return value.map(p => (p && (p.text || p.content)) || (typeof p === 'string' ? p : JSON.stringify(p))).join('');
+  if (Array.isArray(value)) {
+    return value.map(p => {
+      if (!p) return '';
+      if (typeof p === 'string') return p;
+      if (typeof p === 'object') return p.text || p.content || JSON.stringify(p);
+      return String(p);
+    }).join('');
+  }
   try { return JSON.stringify(value); } catch { return String(value); }
 }
 
@@ -32,33 +38,51 @@ async function callDriverWithToken({ token, body }) {
     try {
       const r = await fetch(host + DRIVER_PATH, {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Accept': 'application/json', 'Origin': 'https://puter.com' },
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'Origin': 'https://puter.com'
+        },
         body: JSON.stringify(body)
       });
+
       const ct = (r.headers.get('content-type') || '').toLowerCase();
       const json = ct.includes('application/json') ? await r.json() : null;
       const text = ct.includes('application/json') ? null : await r.text();
       return { ok: r.ok, status: r.status, json, text, host };
-    } catch (e) { lastErr = e; }
+    } catch (e) {
+      lastErr = e;
+    }
   }
   throw lastErr || new Error('All upstream hosts failed');
 }
 
-export default async function handler(req, res) {
+module.exports = async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const incomingKey = req.headers['authorization']?.replace('Bearer ', '');
-  if (process.env.PROXY_API_KEY && incomingKey !== process.env.PROXY_API_KEY) return res.status(401).json({ error: 'Invalid Proxy API Key' });
+  if (process.env.PROXY_API_KEY && incomingKey !== process.env.PROXY_API_KEY) {
+    return res.status(401).json({ error: 'Invalid Proxy API Key' });
+  }
 
-  if (!hasAnyToken()) return res.status(500).json({ error: 'Missing PUTER_TOKEN(S)' });
+  if (!hasAnyToken()) {
+    return res.status(500).json({ error: 'Server misconfiguration: Missing PUTER_TOKEN(S)' });
+  }
 
   const body = req.body || {};
   const { messages, model, temperature, max_tokens, tools } = body;
   if (!Array.isArray(messages)) return res.status(400).json({ error: 'messages must be an array' });
 
   const selectedModel = model || 'gpt-5-nano';
-  const driverBody = { interface: 'puter-chat-completion', service: pickServiceFromModel(selectedModel), method: 'complete', args: { messages, model: selectedModel, stream: false, temperature, max_tokens, tools } };
+
+  const driverBody = {
+    interface: 'puter-chat-completion',
+    service: pickServiceFromModel(selectedModel),
+    method: 'complete',
+    args: { messages, model: selectedModel, stream: false, temperature, max_tokens, tools }
+  };
 
   const maxAttempts = Math.max(1, Number(process.env.PUTER_TOKEN_MAX_ATTEMPTS || 3));
   let lastErr = null;
@@ -66,20 +90,21 @@ export default async function handler(req, res) {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const token = getToken();
     if (!token) break;
+
     try {
       const upstream = await callDriverWithToken({ token, body: driverBody });
 
       if (upstream.json && typeof upstream.json === 'object' && upstream.json.success === false) {
         const msg = upstream.json?.error?.message || JSON.stringify(upstream.json.error || upstream.json);
-        reportTokenResult(token, { ok: false, status: 502, errorText: msg });
-        lastErr = { msg };
+        reportTokenResult(token, { ok: false, status: 502 });
+        lastErr = msg;
         continue;
       }
 
       if (!upstream.ok) {
         const msg = upstream.text || JSON.stringify(upstream.json || {});
-        reportTokenResult(token, { ok: false, status: upstream.status, errorText: msg });
-        lastErr = { msg };
+        reportTokenResult(token, { ok: false, status: upstream.status });
+        lastErr = msg;
         if ([401,403,429].includes(upstream.status) || (upstream.status >= 500 && upstream.status <= 599)) continue;
         return res.status(upstream.status).json({ error: { message: msg, type: 'upstream_error' } });
       }
@@ -98,11 +123,11 @@ export default async function handler(req, res) {
         usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
       });
     } catch (e) {
-      lastErr = { msg: String(e?.message || e) };
-      reportTokenResult(token, { ok: false, status: 599, errorText: lastErr.msg });
+      lastErr = String(e?.message || e);
+      reportTokenResult(token, { ok: false, status: 599 });
       continue;
     }
   }
 
-  return res.status(502).json({ error: { message: lastErr?.msg || 'All tokens failed', type: 'upstream_error' } });
-}
+  return res.status(502).json({ error: { message: lastErr || 'All tokens failed', type: 'upstream_error' } });
+};
