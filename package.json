@@ -1,0 +1,9 @@
+{
+  "name": "puter-openai-proxy",
+  "version": "1.1.0",
+  "description": "OpenAI-compatible proxy for Puter.js (chat + models + embeddings)",
+  "scripts": {
+    "start": "vercel dev"
+  },
+  "dependencies": {}
+}
