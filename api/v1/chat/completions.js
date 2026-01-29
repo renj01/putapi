@@ -1,17 +1,8 @@
-// Chat Completions (CommonJS) + PUTER_TOKENS rotation + Streaming (OpenAI SSE) + Heartbeats
+// Chat Completions (CommonJS) + PUTER_TOKENS rotation + Streaming (OpenAI SSE) + Heartbeats (DATA frames)
+// Fix: some clients (e.g., Open WebUI) may not ignore SSE comment frames (": ...") and can crash.
+// So we ONLY send valid OpenAI "data: {...}" frames for heartbeats/keepalive (no ":" comment frames).
 //
-// Fix for Zeabur/Open WebUI 504 timeouts:
-// - Send an immediate SSE "heartbeat" chunk after headers (flushes bytes ASAP)
-// - Send periodic SSE comments (": keep-alive") every HEARTBEAT_MS while streaming
-//
-// Features kept:
-// - web_search (OpenAI models) routed through legacy puter.ai/chat
-// - fallback to legacy when puter-chat-completion is missing
-// - openai -> openai-completion mapping
-// - omit temperature for openai unless forced
-//
-// Env (optional):
-// - SSE_HEARTBEAT_MS (default 8000)
+// Env (optional): SSE_HEARTBEAT_MS (default 8000)
 
 const { hasAnyToken, getToken, reportTokenResult } = require('./tokenPool');
 
@@ -86,17 +77,10 @@ function writeSSE(res, obj) {
   res.write(`data: ${JSON.stringify(obj)}\n\n`);
 }
 
-function writeSSEComment(res, comment) {
-  // SSE comment frames are valid keep-alive signals
-  res.write(`: ${comment || 'keep-alive'}\n\n`);
-}
-
-function startHeartbeat(res) {
-  // Send periodic SSE comments to keep the connection alive through proxies
+function startHeartbeat(res, makeChunk) {
   const t = setInterval(() => {
-    try { writeSSEComment(res, 'keep-alive'); } catch {}
+    try { writeSSE(res, makeChunk()); } catch {}
   }, HEARTBEAT_MS);
-  // Don’t keep event loop alive (serverless friendliness)
   t.unref?.();
   return t;
 }
@@ -143,20 +127,23 @@ async function streamAsOpenAI({ upstreamResponse, res, selectedModel }) {
   const created = Math.floor(Date.now() / 1000);
   const idBase = 'chatcmpl-' + Date.now();
 
-  // **Immediate flush** to avoid gateway timeouts:
-  // 1) comment frame (tiny bytes)
-  writeSSEComment(res, 'init');
-  // 2) minimal valid OpenAI chunk
+  // Immediate "data" heartbeat to flush bytes ASAP (no comment frames)
   writeSSE(res, {
     id: idBase,
     object: 'chat.completion.chunk',
     created,
     model: selectedModel,
-    choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
+    choices: [{ index: 0, delta: { content: '' }, finish_reason: null }]
   });
 
-  // Periodic keep-alives
-  const hb = startHeartbeat(res);
+  // Periodic keepalive as empty-content chunk
+  const hb = startHeartbeat(res, () => ({
+    id: idBase,
+    object: 'chat.completion.chunk',
+    created,
+    model: selectedModel,
+    choices: [{ index: 0, delta: { content: '' }, finish_reason: null }]
+  }));
 
   const reader = upstreamResponse.body?.getReader?.();
   const decoder = new TextDecoder();
@@ -192,12 +179,15 @@ async function streamAsOpenAI({ upstreamResponse, res, selectedModel }) {
         if (line.startsWith('data:')) {
           const payload = line.slice(5).trim();
           if (payload === '[DONE]') {
+            buf = ''; // ignore remainder
             break;
           }
 
           let text = null;
           try {
             const j = JSON.parse(payload);
+
+            // If upstream is already OpenAI chunk, forward content if present
             text =
               j?.choices?.[0]?.delta?.content ??
               j?.choices?.[0]?.message?.content ??
@@ -221,7 +211,6 @@ async function streamAsOpenAI({ upstreamResponse, res, selectedModel }) {
             });
           }
         } else {
-          // Non-SSE line; stream as content
           writeSSE(res, {
             id: idBase,
             object: 'chat.completion.chunk',
@@ -232,7 +221,6 @@ async function streamAsOpenAI({ upstreamResponse, res, selectedModel }) {
         }
       }
 
-      // If upstream isn't line-based, flush periodically to avoid buffering forever
       if (buf.length > 2048 && !buf.includes('\n')) {
         writeSSE(res, {
           id: idBase,
@@ -245,7 +233,6 @@ async function streamAsOpenAI({ upstreamResponse, res, selectedModel }) {
       }
     }
 
-    // Flush any remainder
     if (buf) {
       writeSSE(res, {
         id: idBase,
@@ -323,7 +310,6 @@ module.exports = async function handler(req, res) {
     if (!token) break;
 
     try {
-      // Web search: legacy FIRST (best compatibility)
       if (wantWebSearch) {
         const { response: r } = await fetchUpstream({ token, body: legacyBody });
 
@@ -361,7 +347,6 @@ module.exports = async function handler(req, res) {
         });
       }
 
-      // Primary interface
       const { response: r1 } = await fetchUpstream({ token, body: primaryBody });
 
       if (wantStream && r1.ok && r1.body) {
@@ -375,7 +360,6 @@ module.exports = async function handler(req, res) {
         lastMsg = msg; lastStatus = 502;
         reportTokenResult(token, { ok: false, status: 502 });
 
-        // If no-implementation -> try legacy once
         if (isNoImplError(msg)) {
           const { response: r2 } = await fetchUpstream({ token, body: legacyBody });
 
