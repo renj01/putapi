@@ -1,13 +1,11 @@
-// Chat Completions (CommonJS) + PUTER_TOKENS rotation
-// Patch: Puter web_search tool support (OpenAI models only) + safe filtering.
-//
-// Blog announcement: web search is now available in puter.ai.chat for OpenAI models (tools: [{type:"web_search"}]).
-// Docs also say Web Search is specific to OpenAI models.
-//
-// Behavior:
-// - If tools include {type:"web_search"} => only forward to OpenAI models (openai/* or gpt*)
-// - For non-OpenAI models, web_search is stripped to avoid upstream errors.
-// - Keeps: interface fallback + openai service mapping + omit temperature for openai by default.
+// Chat Completions (CommonJS) + PUTER_TOKENS rotation + Streaming (OpenAI SSE)
+// Supports:
+// - Non-stream JSON responses (OpenAI-compatible)
+// - stream=true with Accept: text/event-stream (OpenAI SSE compatible)
+// - Puter web_search (OpenAI models) routed through legacy puter.ai/chat (best compatibility)
+// - Fallback to legacy when puter-chat-completion is missing
+// - openai -> openai-completion service mapping
+// - omit temperature for openai unless forced (PUTER_OPENAI_ALLOW_TEMPERATURE=true)
 
 const { hasAnyToken, getToken, reportTokenResult } = require('./tokenPool');
 
@@ -51,22 +49,37 @@ function isNoImplError(msg) {
   return typeof msg === 'string' && msg.includes('No implementation available for interface `puter-chat-completion`');
 }
 
+function hasWebSearchTool(tools) {
+  return Array.isArray(tools) && tools.some(t => t && String(t.type).toLowerCase() === 'web_search');
+}
+
 function sanitizeTools(tools, baseService) {
   if (!Array.isArray(tools)) return undefined;
+  const hasWS = hasWebSearchTool(tools);
+  if (!hasWS) return tools;
 
-  const hasWebSearch = tools.some(t => t && String(t.type).toLowerCase() === 'web_search');
-  if (!hasWebSearch) return tools;
-
-  // Only OpenAI models support web_search (per Puter docs/blog). Strip it otherwise.
+  // web_search is specific to OpenAI models; strip otherwise
   if (baseService !== 'openai') {
     const filtered = tools.filter(t => !(t && String(t.type).toLowerCase() === 'web_search'));
     return filtered.length ? filtered : undefined;
   }
-
   return tools;
 }
 
-async function callDriver({ token, body }) {
+function sseHeaders(res) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+}
+
+function writeSSE(res, obj) {
+  res.write(`data: ${JSON.stringify(obj)}\n\n`);
+}
+
+async function fetchUpstream({ token, body }) {
   let lastErr = null;
   for (const host of HOSTS) {
     try {
@@ -75,21 +88,158 @@ async function callDriver({ token, body }) {
         headers: {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'Origin': 'https://puter.com'
+          'Accept': 'application/json, text/event-stream',
+          'Origin': 'https://puter.com',
         },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
       });
-
-      const ct = (r.headers.get('content-type') || '').toLowerCase();
-      const json = ct.includes('application/json') ? await r.json() : null;
-      const text = ct.includes('application/json') ? null : await r.text();
-      return { ok: r.ok, status: r.status, json, text, host };
+      return { response: r, host };
     } catch (e) {
       lastErr = e;
     }
   }
   throw lastErr || new Error('All upstream hosts failed');
+}
+
+async function readJsonSafe(r) {
+  const ct = (r.headers.get('content-type') || '').toLowerCase();
+  if (!ct.includes('application/json')) return null;
+  try { return await r.json(); } catch { return null; }
+}
+
+async function readTextSafe(r) {
+  try { return await r.text(); } catch { return ''; }
+}
+
+function isRetryableStatus(status) {
+  return status === 401 || status === 403 || status === 429 || (status >= 500 && status <= 599) || status === 599;
+}
+
+async function handleStreamFromUpstream({ upstreamResponse, res, selectedModel }) {
+  sseHeaders(res);
+
+  const created = Math.floor(Date.now() / 1000);
+  const idBase = 'chatcmpl-' + Date.now();
+
+  // initial role chunk
+  writeSSE(res, {
+    id: idBase,
+    object: 'chat.completion.chunk',
+    created,
+    model: selectedModel,
+    choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
+  });
+
+  const reader = upstreamResponse.body?.getReader?.();
+  const decoder = new TextDecoder();
+
+  if (!reader) {
+    writeSSE(res, {
+      id: idBase,
+      object: 'chat.completion.chunk',
+      created,
+      model: selectedModel,
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+    });
+    res.write('data: [DONE]\n\n');
+    return res.end();
+  }
+
+  let buf = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+
+    let idx;
+    while ((idx = buf.indexOf('\n')) !== -1) {
+      const rawLine = buf.slice(0, idx);
+      buf = buf.slice(idx + 1);
+
+      const line = rawLine.trimEnd();
+      if (!line) continue;
+
+      if (line.startsWith('data:')) {
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]') {
+          writeSSE(res, {
+            id: idBase,
+            object: 'chat.completion.chunk',
+            created,
+            model: selectedModel,
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+          });
+          res.write('data: [DONE]\n\n');
+          return res.end();
+        }
+
+        let text = null;
+        try {
+          const j = JSON.parse(payload);
+          text =
+            j?.choices?.[0]?.delta?.content ??
+            j?.choices?.[0]?.message?.content ??
+            j?.message?.content ??
+            j?.content ??
+            null;
+
+          if (text == null && typeof j === 'string') text = j;
+          if (text == null) text = payload;
+        } catch {
+          text = payload;
+        }
+
+        if (text) {
+          writeSSE(res, {
+            id: idBase,
+            object: 'chat.completion.chunk',
+            created,
+            model: selectedModel,
+            choices: [{ index: 0, delta: { content: String(text) }, finish_reason: null }]
+          });
+        }
+      } else {
+        writeSSE(res, {
+          id: idBase,
+          object: 'chat.completion.chunk',
+          created,
+          model: selectedModel,
+          choices: [{ index: 0, delta: { content: line + '\n' }, finish_reason: null }]
+        });
+      }
+    }
+
+    if (buf.length > 2048 && !buf.includes('\n')) {
+      writeSSE(res, {
+        id: idBase,
+        object: 'chat.completion.chunk',
+        created,
+        model: selectedModel,
+        choices: [{ index: 0, delta: { content: buf }, finish_reason: null }]
+      });
+      buf = '';
+    }
+  }
+
+  if (buf) {
+    writeSSE(res, {
+      id: idBase,
+      object: 'chat.completion.chunk',
+      created,
+      model: selectedModel,
+      choices: [{ index: 0, delta: { content: buf }, finish_reason: null }]
+    });
+  }
+
+  writeSSE(res, {
+    id: idBase,
+    object: 'chat.completion.chunk',
+    created,
+    model: selectedModel,
+    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+  });
+  res.write('data: [DONE]\n\n');
+  return res.end();
 }
 
 module.exports = async function handler(req, res) {
@@ -114,92 +264,156 @@ module.exports = async function handler(req, res) {
   const service = mapOpenAIService(baseService);
 
   const safeTools = sanitizeTools(tools, baseService);
-
-  // Build args; omit temperature for openai unless forced
-  const args = { messages, model: selectedModel, stream: false, max_tokens };
-  if (safeTools) args.tools = safeTools;
+  const wantWebSearch = baseService === 'openai' && hasWebSearchTool(safeTools);
 
   const allowTemp = baseService !== 'openai' || process.env.PUTER_OPENAI_ALLOW_TEMPERATURE === 'true';
-  if (allowTemp && typeof temperature === 'number') args.temperature = temperature;
 
-  const driverBody = {
-    interface: 'puter-chat-completion',
-    service,
-    method: 'complete',
-    args
-  };
+  const accept = String(req.headers['accept'] || '').toLowerCase();
+  const wantStream = body.stream === true && accept.includes('text/event-stream');
+
+  const primaryArgs = { messages, model: selectedModel, stream: wantStream, max_tokens };
+  if (safeTools) primaryArgs.tools = safeTools;
+  if (allowTemp && typeof temperature === 'number') primaryArgs.temperature = temperature;
+
+  const primaryBody = { interface: 'puter-chat-completion', service, method: 'complete', args: primaryArgs };
 
   const legacyOpts = {
     model: selectedModel,
-    stream: false,
+    stream: wantStream,
     ...(typeof max_tokens === 'number' ? { max_tokens } : {}),
     ...(safeTools ? { tools: safeTools } : {}),
     ...(allowTemp && typeof temperature === 'number' ? { temperature } : {}),
   };
-
-  const legacyBody = {
-    interface: 'puter.ai',
-    method: 'chat',
-    args: [messages, legacyOpts]
-  };
+  const legacyBody = { interface: 'puter.ai', method: 'chat', args: [messages, legacyOpts] };
 
   const maxAttempts = Math.max(1, Number(process.env.PUTER_TOKEN_MAX_ATTEMPTS || 3));
   let lastMsg = null;
+  let lastStatus = 502;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const token = getToken();
     if (!token) break;
 
     try {
-      let upstream = await callDriver({ token, body: driverBody });
+      // Web search: legacy FIRST
+      if (wantWebSearch) {
+        const { response: r } = await fetchUpstream({ token, body: legacyBody });
 
-      if (upstream.json && typeof upstream.json === 'object' && upstream.json.success === false) {
-        const msg = upstream.json?.error?.message || JSON.stringify(upstream.json.error || upstream.json);
-        lastMsg = msg;
+        if (wantStream && r.ok && r.body) {
+          reportTokenResult(token, { ok: true, status: 200 });
+          return await handleStreamFromUpstream({ upstreamResponse: r, res, selectedModel });
+        }
 
-        if (isNoImplError(msg)) {
-          upstream = await callDriver({ token, body: legacyBody });
-
-          if (upstream.json && typeof upstream.json === 'object' && upstream.json.success === false) {
-            const msg2 = upstream.json?.error?.message || JSON.stringify(upstream.json.error || upstream.json);
-            lastMsg = msg2;
-            reportTokenResult(token, { ok: false, status: 502 });
-            continue;
-          }
-        } else {
+        const j = await readJsonSafe(r);
+        if (j && typeof j === 'object' && j.success === false) {
+          const msg = j?.error?.message || JSON.stringify(j.error || j);
+          lastMsg = msg; lastStatus = 502;
           reportTokenResult(token, { ok: false, status: 502 });
           continue;
         }
+        if (!r.ok) {
+          const msg = (j ? JSON.stringify(j) : await readTextSafe(r));
+          lastMsg = msg; lastStatus = r.status;
+          reportTokenResult(token, { ok: false, status: r.status });
+          if (isRetryableStatus(r.status)) continue;
+          return res.status(r.status).json({ error: { message: msg, type: 'upstream_error' } });
+        }
+
+        const result = j?.result ?? j ?? await readTextSafe(r);
+        reportTokenResult(token, { ok: true, status: 200 });
+
+        const content = normalizeContent(result?.message?.content ?? result?.content ?? result);
+        return res.status(200).json({
+          id: 'chatcmpl-' + Date.now(),
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000),
+          model: selectedModel,
+          choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        });
       }
 
-      if (!upstream.ok) {
-        const msg = upstream.text || JSON.stringify(upstream.json || {});
-        lastMsg = msg;
-        reportTokenResult(token, { ok: false, status: upstream.status });
-        if ([401,403,429].includes(upstream.status) || (upstream.status >= 500 && upstream.status <= 599)) continue;
-        return res.status(upstream.status).json({ error: { message: msg, type: 'upstream_error' } });
+      // Primary
+      const { response: r1 } = await fetchUpstream({ token, body: primaryBody });
+
+      if (wantStream && r1.ok && r1.body) {
+        reportTokenResult(token, { ok: true, status: 200 });
+        return await handleStreamFromUpstream({ upstreamResponse: r1, res, selectedModel });
       }
 
+      const j1 = await readJsonSafe(r1);
+      if (j1 && typeof j1 === 'object' && j1.success === false) {
+        const msg = j1?.error?.message || JSON.stringify(j1.error || j1);
+        lastMsg = msg; lastStatus = 502;
+        reportTokenResult(token, { ok: false, status: 502 });
+
+        if (isNoImplError(msg)) {
+          const { response: r2 } = await fetchUpstream({ token, body: legacyBody });
+
+          if (wantStream && r2.ok && r2.body) {
+            reportTokenResult(token, { ok: true, status: 200 });
+            return await handleStreamFromUpstream({ upstreamResponse: r2, res, selectedModel });
+          }
+
+          const j2 = await readJsonSafe(r2);
+          if (j2 && typeof j2 === 'object' && j2.success === false) {
+            const msg2 = j2?.error?.message || JSON.stringify(j2.error || j2);
+            lastMsg = msg2; lastStatus = 502;
+            reportTokenResult(token, { ok: false, status: 502 });
+            continue;
+          }
+          if (!r2.ok) {
+            const msg2 = (j2 ? JSON.stringify(j2) : await readTextSafe(r2));
+            lastMsg = msg2; lastStatus = r2.status;
+            reportTokenResult(token, { ok: false, status: r2.status });
+            if (isRetryableStatus(r2.status)) continue;
+            return res.status(r2.status).json({ error: { message: msg2, type: 'upstream_error' } });
+          }
+
+          const result2 = j2?.result ?? j2 ?? await readTextSafe(r2);
+          reportTokenResult(token, { ok: true, status: 200 });
+          const content2 = normalizeContent(result2?.message?.content ?? result2?.content ?? result2);
+          return res.status(200).json({
+            id: 'chatcmpl-' + Date.now(),
+            object: 'chat.completion',
+            created: Math.floor(Date.now() / 1000),
+            model: selectedModel,
+            choices: [{ index: 0, message: { role: 'assistant', content: content2 }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+          });
+        }
+
+        continue;
+      }
+
+      if (!r1.ok) {
+        const msg = (j1 ? JSON.stringify(j1) : await readTextSafe(r1));
+        lastMsg = msg; lastStatus = r1.status;
+        reportTokenResult(token, { ok: false, status: r1.status });
+        if (isRetryableStatus(r1.status)) continue;
+        return res.status(r1.status).json({ error: { message: msg, type: 'upstream_error' } });
+      }
+
+      const result1 = j1?.result ?? j1 ?? await readTextSafe(r1);
       reportTokenResult(token, { ok: true, status: 200 });
-
-      const result = upstream.json?.result ?? upstream.json ?? upstream.text;
-      const content = normalizeContent(result?.message?.content ?? result?.content ?? result);
+      const content1 = normalizeContent(result1?.message?.content ?? result1?.content ?? result1);
 
       return res.status(200).json({
         id: 'chatcmpl-' + Date.now(),
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model: selectedModel,
-        choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
-        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+        choices: [{ index: 0, message: { role: 'assistant', content: content1 }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
       });
 
     } catch (e) {
       lastMsg = String(e?.message || e);
+      lastStatus = 502;
       reportTokenResult(token, { ok: false, status: 599 });
       continue;
     }
   }
 
-  return res.status(502).json({ error: { message: lastMsg || 'All tokens failed', type: 'upstream_error' } });
+  return res.status(lastStatus).json({ error: { message: lastMsg || 'All tokens failed', type: 'upstream_error' } });
 };
