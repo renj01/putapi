@@ -1,11 +1,35 @@
-// OpenAI-compatible Embeddings -> Puter Drivers API + token rotation
-import { getToken, hasAnyToken, reportTokenResult } from '../_lib/tokenPool.js';
+// Embeddings (CommonJS) + PUTER_TOKENS rotation (reuses chat/tokenPool.js)
+// Works with your current setup where tokenPool is located at: api/v1/chat/tokenPool.js
+//
+// Env knobs (optional):
+// - PUTER_EMBEDDINGS_SERVICE: override service name (default: "openai")
+// - PUTER_EMBEDDINGS_INTERFACE: override interface name (default: "puter-embeddings")
+// - PUTER_EMBEDDINGS_METHOD: override method name (default: "embed")
+//
+// Notes:
+// - Retries next token on: 401/403/429/5xx and on driver "No implementation available" errors
+// - Normalizes multiple upstream response shapes into OpenAI Embeddings format
+
+const { hasAnyToken, getToken, reportTokenResult } = require('./chat/tokenPool');
 
 const DRIVER_PATH = '/drivers/call';
 const HOSTS = ['https://api.puter.com', 'https://puter.com'];
 
+function normalizeInput(input) {
+  if (typeof input === 'string') return input;
+  if (Array.isArray(input)) {
+    // Ensure it's an array of strings (OpenAI allows array of strings)
+    return input.map(x => (typeof x === 'string' ? x : JSON.stringify(x)));
+  }
+  return null;
+}
+
+function isNoImplError(msg) {
+  return typeof msg === 'string' && msg.includes('No implementation available for interface');
+}
+
 async function callDriverWithToken({ token, body }) {
-  let last = null;
+  let lastErr = null;
   for (const host of HOSTS) {
     try {
       const r = await fetch(host + DRIVER_PATH, {
@@ -24,13 +48,64 @@ async function callDriverWithToken({ token, body }) {
       const text = ct.includes('application/json') ? null : await r.text();
       return { ok: r.ok, status: r.status, json, text, host };
     } catch (e) {
-      last = e;
+      lastErr = e;
     }
   }
-  throw last || new Error('All upstream hosts failed');
+  throw lastErr || new Error('All upstream hosts failed');
 }
 
-export default async function handler(req, res) {
+function toOpenAIEmbeddings({ model, input, upstream }) {
+  // Try a few common shapes:
+  // 1) Already OpenAI-like: {object:"list", data:[{embedding: [...] }], model:"..."}
+  if (upstream && typeof upstream === 'object' && upstream.object === 'list' && Array.isArray(upstream.data)) {
+    return upstream;
+  }
+
+  // 2) Upstream returns { embedding: [...] } or { data: { embedding: [...] } }
+  const directEmbedding = upstream?.embedding || upstream?.data?.embedding;
+  if (Array.isArray(directEmbedding)) {
+    return {
+      object: 'list',
+      data: [{ object: 'embedding', index: 0, embedding: directEmbedding }],
+      model,
+      usage: { prompt_tokens: 0, total_tokens: 0 }
+    };
+  }
+
+  // 3) Upstream returns array of vectors (one per input)
+  if (Array.isArray(upstream) && upstream.length && Array.isArray(upstream[0])) {
+    return {
+      object: 'list',
+      data: upstream.map((vec, i) => ({ object: 'embedding', index: i, embedding: vec })),
+      model,
+      usage: { prompt_tokens: 0, total_tokens: 0 }
+    };
+  }
+
+  // 4) Upstream returns { data: [ [..vec..], [..vec..] ] }
+  if (Array.isArray(upstream?.data) && upstream.data.length && Array.isArray(upstream.data[0])) {
+    return {
+      object: 'list',
+      data: upstream.data.map((vec, i) => ({ object: 'embedding', index: i, embedding: vec })),
+      model,
+      usage: { prompt_tokens: 0, total_tokens: 0 }
+    };
+  }
+
+  // 5) If input was a single string and upstream is a single vector
+  if (typeof input === 'string' && Array.isArray(upstream)) {
+    return {
+      object: 'list',
+      data: [{ object: 'embedding', index: 0, embedding: upstream }],
+      model,
+      usage: { prompt_tokens: 0, total_tokens: 0 }
+    };
+  }
+
+  return null;
+}
+
+module.exports = async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
@@ -43,22 +118,28 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: 'Server misconfiguration: Missing PUTER_TOKEN(S)' });
   }
 
-  const { input, model } = req.body || {};
-  const selectedModel = model || 'text-embedding-3-small';
+  const body = req.body || {};
+  const input = normalizeInput(body.input);
+  const model = body.model || 'text-embedding-3-small';
 
-  if (typeof input !== 'string' && !Array.isArray(input)) {
+  if (input == null) {
     return res.status(400).json({ error: 'Invalid request: input must be a string or array of strings' });
   }
 
+  const iface = process.env.PUTER_EMBEDDINGS_INTERFACE || 'puter-embeddings';
+  const method = process.env.PUTER_EMBEDDINGS_METHOD || 'embed';
+  const service = process.env.PUTER_EMBEDDINGS_SERVICE || 'openai';
+
   const driverBody = {
-    interface: 'puter-embeddings',
-    service: 'openai',
-    method: 'embed',
-    args: { input, model: selectedModel }
+    interface: iface,
+    service,
+    method,
+    args: { input, model }
   };
 
   const maxAttempts = Math.max(1, Number(process.env.PUTER_TOKEN_MAX_ATTEMPTS || 3));
-  let lastErr = null;
+  let lastMsg = null;
+  let lastStatus = 502;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const token = getToken();
@@ -67,56 +148,59 @@ export default async function handler(req, res) {
     try {
       const upstream = await callDriverWithToken({ token, body: driverBody });
 
+      // Envelope error?
       if (upstream.json && typeof upstream.json === 'object' && upstream.json.success === false) {
         const msg = upstream.json?.error?.message || JSON.stringify(upstream.json.error || upstream.json);
-        reportTokenResult(token, { ok: false, status: 502, errorText: msg });
-        lastErr = { status: 502, msg };
+        lastMsg = msg;
+        lastStatus = 502;
+
+        // Treat "no implementation" as retryable across tokens
+        if (isNoImplError(msg)) {
+          reportTokenResult(token, { ok: false, status: 502 });
+          continue;
+        }
+
+        reportTokenResult(token, { ok: false, status: 502 });
         continue;
       }
 
+      // HTTP error?
       if (!upstream.ok) {
         const msg = upstream.text || JSON.stringify(upstream.json || {});
-        reportTokenResult(token, { ok: false, status: upstream.status, errorText: msg });
-        lastErr = { status: upstream.status, msg };
-        if (upstream.status === 429 || (upstream.status >= 500 && upstream.status <= 599) || upstream.status === 401 || upstream.status === 403) continue;
+        lastMsg = msg;
+        lastStatus = upstream.status;
+        reportTokenResult(token, { ok: false, status: upstream.status });
+
+        if ([401,403,429].includes(upstream.status) || (upstream.status >= 500 && upstream.status <= 599)) continue;
         return res.status(upstream.status).json({ error: { message: msg, type: 'upstream_error' } });
       }
 
       reportTokenResult(token, { ok: true, status: 200 });
 
       const result = upstream.json?.result ?? upstream.json ?? upstream.text;
+      const mapped = toOpenAIEmbeddings({ model, input, upstream: result });
 
-      // Normalize embeddings to OpenAI list
-      if (result && Array.isArray(result.data)) {
-        return res.status(200).json({ ...result, model: result.model || selectedModel });
-      }
-
-      if (Array.isArray(result)) {
-        return res.status(200).json({
-          object: 'list',
-          data: [{ object: 'embedding', index: 0, embedding: result }],
-          model: selectedModel,
-          usage: { prompt_tokens: 0, total_tokens: 0 }
+      if (!mapped) {
+        return res.status(502).json({
+          error: {
+            message: 'Unrecognized upstream embeddings response shape',
+            type: 'upstream_error',
+            details: result
+          }
         });
       }
 
-      if (Array.isArray(result?.embedding)) {
-        return res.status(200).json({
-          object: 'list',
-          data: [{ object: 'embedding', index: 0, embedding: result.embedding }],
-          model: selectedModel,
-          usage: { prompt_tokens: 0, total_tokens: 0 }
-        });
-      }
-
-      return res.status(502).json({ error: { message: 'Unrecognized upstream embeddings response shape', type: 'upstream_error', details: result } });
+      // Ensure correct model field
+      if (!mapped.model) mapped.model = model;
+      return res.status(200).json(mapped);
 
     } catch (e) {
-      lastErr = { status: 500, msg: String(e?.message || e) };
-      reportTokenResult(token, { ok: false, status: 599, errorText: lastErr.msg });
+      lastMsg = String(e?.message || e);
+      lastStatus = 502;
+      reportTokenResult(token, { ok: false, status: 599 });
       continue;
     }
   }
 
-  return res.status(502).json({ error: { message: lastErr?.msg || 'All tokens failed', type: 'upstream_error' } });
-}
+  return res.status(lastStatus).json({ error: { message: lastMsg || 'All tokens failed', type: 'upstream_error' } });
+};
