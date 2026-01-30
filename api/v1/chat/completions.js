@@ -1,10 +1,11 @@
 // Chat Completions (Edge Runtime)
-// Bypasses Vercel 10s/60s timeouts for long streaming responses.
+// Bypasses timeouts and includes aggressive retries for upstream 504 errors.
 
-import { hasAnyToken, getToken, reportTokenResult } from './tokenPool';
+import { hasAnyToken, getToken, reportTokenResult } from './tokenPool.js';
 
 export const config = {
   runtime: 'edge',
+  regions: ['iad1', 'cle1', 'sfo1', 'pdx1'], // Optional: US regions often have better connectivity
 };
 
 const DRIVER_PATH = '/drivers/call';
@@ -19,14 +20,10 @@ function mapOpenAIService(service) {
 function pickServiceFromModel(modelId = '') {
   const m = (modelId || '').toLowerCase();
   if (m.includes('/')) return m.split('/')[0];
+  if (m.startsWith('gpt')) return 'openai';
   if (m.startsWith('claude')) return 'claude';
   if (m.startsWith('gemini')) return 'gemini';
-  if (m.startsWith('grok') || m.startsWith('xai')) return 'xai';
   if (m.startsWith('mistral')) return 'mistral';
-  if (m.startsWith('deepseek')) return 'deepseek';
-  if (m.startsWith('openrouter')) return 'openrouter';
-  if (m.startsWith('qwen')) return 'qwen';
-  if (m.startsWith('gpt')) return 'openai';
   return 'openai';
 }
 
@@ -52,6 +49,7 @@ function isNoImplError(msg) {
 
 async function fetchUpstream({ token, body }) {
   let lastErr = null;
+  // Try hosts (redundancy)
   for (const host of HOSTS) {
     try {
       const r = await fetch(host + DRIVER_PATH, {
@@ -61,6 +59,7 @@ async function fetchUpstream({ token, body }) {
           'Content-Type': 'application/json',
           'Accept': 'application/json, text/event-stream',
           'Origin': 'https://puter.com',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         },
         body: JSON.stringify(body),
       });
@@ -83,7 +82,7 @@ function createStreamResponse(upstreamResponse, selectedModel) {
     async start(controller) {
       const enqueue = (data) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
       
-      // 1. Send initial chunk immediately
+      // 1. Send initial chunk
       enqueue({
         id: idBase, object: 'chat.completion.chunk', created, model: selectedModel,
         choices: [{ index: 0, delta: { content: '' }, finish_reason: null }]
@@ -121,7 +120,7 @@ function createStreamResponse(upstreamResponse, selectedModel) {
             if (line.startsWith('data:')) {
               const payload = line.slice(5).trim();
               if (payload === '[DONE]') {
-                buf = ''; // stop processing
+                buf = ''; 
                 break;
               }
 
@@ -154,7 +153,6 @@ function createStreamResponse(upstreamResponse, selectedModel) {
             }
           }
           
-          // Flush buffer if it gets too large
           if (buf.length > 2048 && !buf.includes('\n')) {
              enqueue({
                 id: idBase, object: 'chat.completion.chunk', created, model: selectedModel,
@@ -164,7 +162,6 @@ function createStreamResponse(upstreamResponse, selectedModel) {
           }
         }
         
-        // Final flush
         if (buf) {
              enqueue({
                 id: idBase, object: 'chat.completion.chunk', created, model: selectedModel,
@@ -172,7 +169,6 @@ function createStreamResponse(upstreamResponse, selectedModel) {
              });
         }
 
-        // Finish
         enqueue({
           id: idBase, object: 'chat.completion.chunk', created, model: selectedModel,
           choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
@@ -204,7 +200,6 @@ export default async function handler(req) {
   if (req.method === 'OPTIONS') return new Response(null, { status: 200 });
   if (req.method !== 'POST') return new Response(JSON.stringify({ error: 'Method not allowed' }), { status: 405 });
 
-  // Authorization check
   const authHeader = req.headers.get('authorization') || '';
   const incomingKey = authHeader.replace('Bearer ', '');
   if (process.env.PROXY_API_KEY && incomingKey !== process.env.PROXY_API_KEY) {
@@ -225,14 +220,12 @@ export default async function handler(req) {
   const baseService = pickServiceFromModel(selectedModel);
   const service = mapOpenAIService(baseService);
 
-  const allowTemp = baseService !== 'openai' || process.env.PUTER_OPENAI_ALLOW_TEMPERATURE === 'true';
-
   const accept = (req.headers.get('accept') || '').toLowerCase();
   const wantStream = body.stream === true && accept.includes('text/event-stream');
 
   const primaryArgs = { messages, model: selectedModel, stream: wantStream, max_tokens };
   if (tools) primaryArgs.tools = tools;
-  if (allowTemp && typeof temperature === 'number') primaryArgs.temperature = temperature;
+  if (typeof temperature === 'number') primaryArgs.temperature = temperature;
 
   const primaryBody = { interface: 'puter-chat-completion', service, method: 'complete', args: primaryArgs };
 
@@ -241,11 +234,12 @@ export default async function handler(req) {
     stream: wantStream,
     ...(typeof max_tokens === 'number' ? { max_tokens } : {}),
     ...(tools ? { tools } : {}),
-    ...(allowTemp && typeof temperature === 'number' ? { temperature } : {}),
+    ...(typeof temperature === 'number' ? { temperature } : {}),
   };
   const legacyBody = { interface: 'puter.ai', method: 'chat', args: [messages, legacyOpts] };
 
-  const maxAttempts = Math.max(1, Number(process.env.PUTER_TOKEN_MAX_ATTEMPTS || 3));
+  // Aggressive retry limit for timeouts
+  const maxAttempts = Math.max(2, Number(process.env.PUTER_TOKEN_MAX_ATTEMPTS || 5));
   
   let lastMsg = null;
   let lastStatus = 502;
@@ -263,7 +257,6 @@ export default async function handler(req) {
         return createStreamResponse(r1, selectedModel);
       }
 
-      // Read JSON carefully (clone if needed or read once)
       let j1 = null;
       let t1 = null;
       const ct1 = (r1.headers.get('content-type') || '').toLowerCase();
@@ -289,12 +282,13 @@ export default async function handler(req) {
         }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       }
 
-      // Check errors
+      // Handle Errors
       if (j1 && typeof j1 === 'object' && j1.success === false) {
         const msg = j1?.error?.message || JSON.stringify(j1.error || j1);
         if (isNoImplError(msg)) {
-          // Fall through to Legacy
+           // Fall through to Legacy
         } else {
+          // If 504 Gateway Timeout from Puter, retry loop will handle it
           lastMsg = msg; lastStatus = 502;
           reportTokenResult(token, { ok: false, status: 502 });
           continue; 
@@ -303,8 +297,8 @@ export default async function handler(req) {
         const msg = j1 ? JSON.stringify(j1) : (t1 || '');
         lastMsg = msg; lastStatus = r1.status;
         reportTokenResult(token, { ok: false, status: r1.status });
-        // Retry logic handled by loop if status is appropriate, but simple retry here:
-        if ([401, 403, 429, 502, 503, 504].includes(r1.status)) continue;
+        // Retry these statuses
+        if ([401, 403, 408, 429, 502, 503, 504].includes(r1.status)) continue;
         return new Response(JSON.stringify({ error: { message: msg, type: 'upstream_error' } }), { status: r1.status });
       }
 
@@ -329,7 +323,7 @@ export default async function handler(req) {
         const msg = j2 ? JSON.stringify(j2) : (t2 || '');
         lastMsg = msg; lastStatus = r2.status;
         reportTokenResult(token, { ok: false, status: r2.status });
-        if ([401, 403, 429, 502, 503, 504].includes(r2.status)) continue;
+        if ([401, 403, 408, 429, 502, 503, 504].includes(r2.status)) continue;
         return new Response(JSON.stringify({ error: { message: msg, type: 'upstream_error' } }), { status: r2.status });
       }
 
