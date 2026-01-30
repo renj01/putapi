@@ -1,16 +1,12 @@
-// CommonJS -> ESM token pool for Vercel Edge Runtime
-// Env: PUTER_TOKENS, PUTER_TOKEN, PUTER_TOKEN_COOLDOWN_MS, PUTER_TOKEN_MAX_ATTEMPTS
+// CommonJS token pool
+// Env: PUTER_TOKENS, PUTER_TOKEN, PUTER_TOKEN_COOLDOWN_MS
 
 const DEFAULT_COOLDOWN_MS = 15 * 60 * 1000;
-
-// Note: In Edge runtime, global state is not guaranteed to persist across all requests,
-// but it works well enough for simple round-robin in warm instances.
 const state = { tokens: [], rrIndex: 0 };
 
 function parseTokens() {
   const raw = process.env.PUTER_TOKENS || process.env.PUTER_TOKEN || '';
   const parts = raw.split(/[\n,\s]+/g).map(s => s.trim()).filter(Boolean);
-
   const seen = new Set();
   const uniq = [];
   for (const t of parts) {
@@ -22,23 +18,20 @@ function parseTokens() {
 function init() {
   const toks = parseTokens();
   if (!toks.length) return;
-
   const existing = state.tokens.map(x => x.token);
   if (existing.length === toks.length && existing.every((t, i) => t === toks[i])) return;
-
   state.tokens = toks.map(t => ({ token: t, disabledUntil: 0, failCount: 0 }));
   state.rrIndex = 0;
 }
 
-export function hasAnyToken() {
+function hasAnyToken() {
   init();
   return state.tokens.length > 0;
 }
 
-export function getToken() {
+function getToken() {
   init();
   if (!state.tokens.length) return null;
-
   const now = Date.now();
   for (let i = 0; i < state.tokens.length; i++) {
     const idx = (state.rrIndex + i) % state.tokens.length;
@@ -48,18 +41,15 @@ export function getToken() {
       return entry.token;
     }
   }
-
-  // all disabled -> pick earliest re-enable
   let best = state.tokens[0];
   for (const e of state.tokens) if (e.disabledUntil < best.disabledUntil) best = e;
   return best.token;
 }
 
-export function reportTokenResult(token, { ok, status }) {
+function report(token, { ok, status }) {
   init();
   const entry = state.tokens.find(e => e.token === token);
   if (!entry) return;
-
   const now = Date.now();
   const cooldownBase = Number(process.env.PUTER_TOKEN_COOLDOWN_MS || DEFAULT_COOLDOWN_MS);
 
@@ -68,19 +58,17 @@ export function reportTokenResult(token, { ok, status }) {
     entry.failCount = 0;
     return;
   }
-
   entry.failCount = (entry.failCount || 0) + 1;
-
   if (status === 401 || status === 403) {
     entry.disabledUntil = now + Math.max(cooldownBase, 60 * 60 * 1000);
     return;
   }
-
-  if (status === 429 || (status >= 500 && status <= 599) || status === 599) {
+  if (status === 429 || status >= 500) {
     const backoff = Math.min(5 * 60 * 1000, cooldownBase * Math.min(8, entry.failCount));
     entry.disabledUntil = now + backoff;
     return;
   }
-
   entry.disabledUntil = now + cooldownBase;
 }
+
+module.exports = { hasAnyToken, getToken, reportTokenResult: report };
