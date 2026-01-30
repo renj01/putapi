@@ -1,8 +1,7 @@
 {
   "name": "puter-openai-proxy",
-  "version": "1.2.0",
-  "description": "OpenAI-compatible proxy for Puter.js (Edge Runtime)",
-  "type": "module",
+  "version": "1.3.0",
+  "description": "OpenAI-compatible proxy for Puter.js (Node.js + Robust Fallback)",
   "scripts": {
     "start": "vercel dev"
   },
