@@ -10,6 +10,11 @@
       ]
     }
   ],
+  "functions": {
+    "api/**/*.js": {
+      "maxDuration": 60
+    }
+  },
   "rewrites": [
     { "source": "/v1/(.*)", "destination": "/api/v1/$1" }
   ]
