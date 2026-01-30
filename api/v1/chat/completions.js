@@ -48,44 +48,6 @@ function isNoImplError(msg) {
   return typeof msg === 'string' && msg.includes('No implementation available for interface `puter-chat-completion`');
 }
 
-// --- UPDATED: Web Search Detection & Transformation ---
-
-function hasSearchIntent(tools) {
-  if (!Array.isArray(tools)) return false;
-  return tools.some(t => {
-    if (!t) return false;
-    // 1. Puter native format
-    if (String(t.type).toLowerCase() === 'web_search') return true;
-    // 2. OpenAI function format (e.g. "web_search", "google_search", "browse")
-    if (t.type === 'function' && t.function?.name) {
-      const n = t.function.name.toLowerCase();
-      return n.includes('search') || n.includes('browse');
-    }
-    return false;
-  });
-}
-
-function sanitizeTools(tools, baseService) {
-  if (!Array.isArray(tools)) return undefined;
-
-  // If search intent is detected, force the tool format Puter expects.
-  // This fixes the issue where standard clients send { type: 'function' ... }
-  // but Puter expects { type: 'web_search' }.
-  if (hasSearchIntent(tools)) {
-    return [{ type: 'web_search' }];
-  }
-
-  // Otherwise, only pass tools if not explicitly restricted (legacy behavior)
-  if (baseService !== 'openai') {
-     // If you want to support tools for other providers, remove this check.
-     // For now, keeping original logic for non-search tools.
-     return tools; 
-  }
-  return tools;
-}
-
-// -----------------------------------------------------
-
 function sseHeaders(res) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -149,6 +111,7 @@ async function streamAsOpenAI({ upstreamResponse, res, selectedModel }) {
   const created = Math.floor(Date.now() / 1000);
   const idBase = 'chatcmpl-' + Date.now();
 
+  // Immediate "data" heartbeat to flush bytes ASAP (no comment frames)
   writeSSE(res, {
     id: idBase,
     object: 'chat.completion.chunk',
@@ -157,6 +120,7 @@ async function streamAsOpenAI({ upstreamResponse, res, selectedModel }) {
     choices: [{ index: 0, delta: { content: '' }, finish_reason: null }]
   });
 
+  // Periodic keepalive as empty-content chunk
   const hb = startHeartbeat(res, () => ({
     id: idBase,
     object: 'chat.completion.chunk',
@@ -199,13 +163,15 @@ async function streamAsOpenAI({ upstreamResponse, res, selectedModel }) {
         if (line.startsWith('data:')) {
           const payload = line.slice(5).trim();
           if (payload === '[DONE]') {
-            buf = ''; 
+            buf = ''; // ignore remainder
             break;
           }
 
           let text = null;
           try {
             const j = JSON.parse(payload);
+
+            // If upstream is already OpenAI chunk, forward content if present
             text =
               j?.choices?.[0]?.delta?.content ??
               j?.choices?.[0]?.message?.content ??
@@ -296,19 +262,13 @@ module.exports = async function handler(req, res) {
   const baseService = pickServiceFromModel(selectedModel);
   const service = mapOpenAIService(baseService);
 
-  // --- UPDATED LOGIC HERE ---
-  // Detect intent first
-  const wantWebSearch = hasSearchIntent(tools);
-  // Transform tools to Puter format if search, otherwise pass through (sanitized)
-  const safeTools = sanitizeTools(tools, baseService);
-
   const allowTemp = baseService !== 'openai' || process.env.PUTER_OPENAI_ALLOW_TEMPERATURE === 'true';
 
   const accept = String(req.headers['accept'] || '').toLowerCase();
   const wantStream = body.stream === true && accept.includes('text/event-stream');
 
   const primaryArgs = { messages, model: selectedModel, stream: wantStream, max_tokens };
-  if (safeTools) primaryArgs.tools = safeTools;
+  if (tools) primaryArgs.tools = tools;
   if (allowTemp && typeof temperature === 'number') primaryArgs.temperature = temperature;
 
   const primaryBody = { interface: 'puter-chat-completion', service, method: 'complete', args: primaryArgs };
@@ -317,7 +277,7 @@ module.exports = async function handler(req, res) {
     model: selectedModel,
     stream: wantStream,
     ...(typeof max_tokens === 'number' ? { max_tokens } : {}),
-    ...(safeTools ? { tools: safeTools } : {}),
+    ...(tools ? { tools } : {}),
     ...(allowTemp && typeof temperature === 'number' ? { temperature } : {}),
   };
   const legacyBody = { interface: 'puter.ai', method: 'chat', args: [messages, legacyOpts] };
@@ -331,45 +291,7 @@ module.exports = async function handler(req, res) {
     if (!token) break;
 
     try {
-      if (wantWebSearch) {
-        // Legacy body (puter.ai) handles the web_search tool correctly
-        const { response: r } = await fetchUpstream({ token, body: legacyBody });
-
-        if (wantStream && r.ok && r.body) {
-          reportTokenResult(token, { ok: true, status: 200 });
-          return await streamAsOpenAI({ upstreamResponse: r, res, selectedModel });
-        }
-
-        const j = await readJsonSafe(r);
-        if (j && typeof j === 'object' && j.success === false) {
-          const msg = j?.error?.message || JSON.stringify(j.error || j);
-          lastMsg = msg; lastStatus = 502;
-          reportTokenResult(token, { ok: false, status: 502 });
-          continue;
-        }
-        if (!r.ok) {
-          const msg = (j ? JSON.stringify(j) : await readTextSafe(r));
-          lastMsg = msg; lastStatus = r.status;
-          reportTokenResult(token, { ok: false, status: r.status });
-          if (isRetryableStatus(r.status)) continue;
-          return res.status(r.status).json({ error: { message: msg, type: 'upstream_error' } });
-        }
-
-        const result = j?.result ?? j ?? await readTextSafe(r);
-        reportTokenResult(token, { ok: true, status: 200 });
-        const content = normalizeContent(result?.message?.content ?? result?.content ?? result);
-
-        return res.status(200).json({
-          id: 'chatcmpl-' + Date.now(),
-          object: 'chat.completion',
-          created: Math.floor(Date.now() / 1000),
-          model: selectedModel,
-          choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
-          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-        });
-      }
-
-      // ... Standard flow (unchanged) ...
+      // 1. Try Primary Interface
       const { response: r1 } = await fetchUpstream({ token, body: primaryBody });
 
       if (wantStream && r1.ok && r1.body) {
@@ -383,6 +305,7 @@ module.exports = async function handler(req, res) {
         lastMsg = msg; lastStatus = 502;
         reportTokenResult(token, { ok: false, status: 502 });
 
+        // 2. Fallback to Legacy Interface (if "Not Implemented" error)
         if (isNoImplError(msg)) {
           const { response: r2 } = await fetchUpstream({ token, body: legacyBody });
 
