@@ -1,5 +1,5 @@
 // Chat Completions (CommonJS) + PUTER_TOKENS rotation + Streaming (OpenAI SSE) + Heartbeats (DATA frames)
-// Optimized: Routes OpenAI models directly to Legacy API to avoid fallback latency.
+// Restored robust fallback logic: Primary -> Legacy (Fixes 504 errors)
 
 const { hasAnyToken, getToken, reportTokenResult } = require('./tokenPool');
 
@@ -108,6 +108,7 @@ async function streamAsOpenAI({ upstreamResponse, res, selectedModel }) {
   const created = Math.floor(Date.now() / 1000);
   const idBase = 'chatcmpl-' + Date.now();
 
+  // Immediate "data" heartbeat
   writeSSE(res, {
     id: idBase,
     object: 'chat.completion.chunk',
@@ -275,13 +276,6 @@ module.exports = async function handler(req, res) {
   };
   const legacyBody = { interface: 'puter.ai', method: 'chat', args: [messages, legacyOpts] };
 
-  // --- OPTIMIZATION START ---
-  // If the service is OpenAI, we assume the Primary Interface (puter-chat-completion) 
-  // might not support it or is slower. We force the Legacy Interface immediately.
-  // Gemini/Claude/Mistral usually work fine on Primary.
-  const forceLegacy = service.includes('openai');
-  // --- OPTIMIZATION END ---
-
   const maxAttempts = Math.max(1, Number(process.env.PUTER_TOKEN_MAX_ATTEMPTS || 3));
   let lastMsg = null;
   let lastStatus = 502;
@@ -291,54 +285,54 @@ module.exports = async function handler(req, res) {
     if (!token) break;
 
     try {
-      // 1. Try Primary Interface (Skipped if forceLegacy is true)
-      if (!forceLegacy) {
-        const { response: r1 } = await fetchUpstream({ token, body: primaryBody });
+      // 1. Try Primary Interface
+      const { response: r1 } = await fetchUpstream({ token, body: primaryBody });
 
-        if (wantStream && r1.ok && r1.body) {
-          reportTokenResult(token, { ok: true, status: 200 });
-          return await streamAsOpenAI({ upstreamResponse: r1, res, selectedModel });
-        }
-
-        const j1 = await readJsonSafe(r1);
-        
-        // If successful JSON response from Primary
-        if (r1.ok && (!j1 || j1.success !== false)) {
-            const result1 = j1?.result ?? j1 ?? await readTextSafe(r1);
-            reportTokenResult(token, { ok: true, status: 200 });
-            const content1 = normalizeContent(result1?.message?.content ?? result1?.content ?? result1);
-
-            return res.status(200).json({
-                id: 'chatcmpl-' + Date.now(),
-                object: 'chat.completion',
-                created: Math.floor(Date.now() / 1000),
-                model: selectedModel,
-                choices: [{ index: 0, message: { role: 'assistant', content: content1 }, finish_reason: 'stop' }],
-                usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-            });
-        }
-
-        // Check failure
-        if (j1 && typeof j1 === 'object' && j1.success === false) {
-          const msg = j1?.error?.message || JSON.stringify(j1.error || j1);
-          // If error is NOT "No Implementation", it's a real error (e.g. rate limit). 
-          // But if it IS "No Impl", we just fall through to legacy below.
-          if (!isNoImplError(msg)) {
-             lastMsg = msg; lastStatus = 502;
-             reportTokenResult(token, { ok: false, status: 502 });
-             continue; // Retry next token or fail
-          }
-        } else if (!r1.ok) {
-           // Standard HTTP error on primary
-           const msg = (j1 ? JSON.stringify(j1) : await readTextSafe(r1));
-           lastMsg = msg; lastStatus = r1.status;
-           reportTokenResult(token, { ok: false, status: r1.status });
-           if (isRetryableStatus(r1.status)) continue;
-           return res.status(r1.status).json({ error: { message: msg, type: 'upstream_error' } });
-        }
+      if (wantStream && r1.ok && r1.body) {
+        reportTokenResult(token, { ok: true, status: 200 });
+        return await streamAsOpenAI({ upstreamResponse: r1, res, selectedModel });
       }
 
-      // 2. Legacy Interface (Runs if forceLegacy=true OR Primary failed with "No Impl")
+      const j1 = await readJsonSafe(r1);
+      
+      // If success on primary, return immediately
+      if (r1.ok && (!j1 || j1.success !== false)) {
+        const result1 = j1?.result ?? j1 ?? await readTextSafe(r1);
+        reportTokenResult(token, { ok: true, status: 200 });
+        const content1 = normalizeContent(result1?.message?.content ?? result1?.content ?? result1);
+
+        return res.status(200).json({
+          id: 'chatcmpl-' + Date.now(),
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000),
+          model: selectedModel,
+          choices: [{ index: 0, message: { role: 'assistant', content: content1 }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        });
+      }
+
+      // Check errors on primary
+      if (j1 && typeof j1 === 'object' && j1.success === false) {
+        const msg = j1?.error?.message || JSON.stringify(j1.error || j1);
+        
+        // ONLY fallback if it's a "Not Implemented" error. 
+        // Other errors (like 500/Rate Limit) might mean we should just fail or retry token.
+        if (isNoImplError(msg)) {
+           // Fall through to Legacy
+        } else {
+           lastMsg = msg; lastStatus = 502;
+           reportTokenResult(token, { ok: false, status: 502 });
+           continue; 
+        }
+      } else if (!r1.ok) {
+        const msg = (j1 ? JSON.stringify(j1) : await readTextSafe(r1));
+        lastMsg = msg; lastStatus = r1.status;
+        reportTokenResult(token, { ok: false, status: r1.status });
+        if (isRetryableStatus(r1.status)) continue;
+        return res.status(r1.status).json({ error: { message: msg, type: 'upstream_error' } });
+      }
+
+      // 2. Legacy Interface Fallback
       const { response: r2 } = await fetchUpstream({ token, body: legacyBody });
 
       if (wantStream && r2.ok && r2.body) {
