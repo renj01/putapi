@@ -1,8 +1,5 @@
 // Chat Completions (CommonJS) + PUTER_TOKENS rotation + Streaming (OpenAI SSE) + Heartbeats (DATA frames)
-// Fix: some clients (e.g., Open WebUI) may not ignore SSE comment frames (": ...") and can crash.
-// So we ONLY send valid OpenAI "data: {...}" frames for heartbeats/keepalive (no ":" comment frames).
-//
-// Env (optional): SSE_HEARTBEAT_MS (default 8000)
+// Optimized: Routes OpenAI models directly to Legacy API to avoid fallback latency.
 
 const { hasAnyToken, getToken, reportTokenResult } = require('./tokenPool');
 
@@ -45,7 +42,7 @@ function normalizeContent(value) {
 }
 
 function isNoImplError(msg) {
-  return typeof msg === 'string' && msg.includes('No implementation available for interface `puter-chat-completion`');
+  return typeof msg === 'string' && msg.includes('No implementation available');
 }
 
 function sseHeaders(res) {
@@ -111,7 +108,6 @@ async function streamAsOpenAI({ upstreamResponse, res, selectedModel }) {
   const created = Math.floor(Date.now() / 1000);
   const idBase = 'chatcmpl-' + Date.now();
 
-  // Immediate "data" heartbeat to flush bytes ASAP (no comment frames)
   writeSSE(res, {
     id: idBase,
     object: 'chat.completion.chunk',
@@ -120,7 +116,6 @@ async function streamAsOpenAI({ upstreamResponse, res, selectedModel }) {
     choices: [{ index: 0, delta: { content: '' }, finish_reason: null }]
   });
 
-  // Periodic keepalive as empty-content chunk
   const hb = startHeartbeat(res, () => ({
     id: idBase,
     object: 'chat.completion.chunk',
@@ -163,15 +158,13 @@ async function streamAsOpenAI({ upstreamResponse, res, selectedModel }) {
         if (line.startsWith('data:')) {
           const payload = line.slice(5).trim();
           if (payload === '[DONE]') {
-            buf = ''; // ignore remainder
+            buf = ''; 
             break;
           }
 
           let text = null;
           try {
             const j = JSON.parse(payload);
-
-            // If upstream is already OpenAI chunk, forward content if present
             text =
               j?.choices?.[0]?.delta?.content ??
               j?.choices?.[0]?.message?.content ??
@@ -282,6 +275,13 @@ module.exports = async function handler(req, res) {
   };
   const legacyBody = { interface: 'puter.ai', method: 'chat', args: [messages, legacyOpts] };
 
+  // --- OPTIMIZATION START ---
+  // If the service is OpenAI, we assume the Primary Interface (puter-chat-completion) 
+  // might not support it or is slower. We force the Legacy Interface immediately.
+  // Gemini/Claude/Mistral usually work fine on Primary.
+  const forceLegacy = service.includes('openai');
+  // --- OPTIMIZATION END ---
+
   const maxAttempts = Math.max(1, Number(process.env.PUTER_TOKEN_MAX_ATTEMPTS || 3));
   let lastMsg = null;
   let lastStatus = 502;
@@ -291,79 +291,86 @@ module.exports = async function handler(req, res) {
     if (!token) break;
 
     try {
-      // 1. Try Primary Interface
-      const { response: r1 } = await fetchUpstream({ token, body: primaryBody });
+      // 1. Try Primary Interface (Skipped if forceLegacy is true)
+      if (!forceLegacy) {
+        const { response: r1 } = await fetchUpstream({ token, body: primaryBody });
 
-      if (wantStream && r1.ok && r1.body) {
-        reportTokenResult(token, { ok: true, status: 200 });
-        return await streamAsOpenAI({ upstreamResponse: r1, res, selectedModel });
-      }
-
-      const j1 = await readJsonSafe(r1);
-      if (j1 && typeof j1 === 'object' && j1.success === false) {
-        const msg = j1?.error?.message || JSON.stringify(j1.error || j1);
-        lastMsg = msg; lastStatus = 502;
-        reportTokenResult(token, { ok: false, status: 502 });
-
-        // 2. Fallback to Legacy Interface (if "Not Implemented" error)
-        if (isNoImplError(msg)) {
-          const { response: r2 } = await fetchUpstream({ token, body: legacyBody });
-
-          if (wantStream && r2.ok && r2.body) {
-            reportTokenResult(token, { ok: true, status: 200 });
-            return await streamAsOpenAI({ upstreamResponse: r2, res, selectedModel });
-          }
-
-          const j2 = await readJsonSafe(r2);
-          if (j2 && typeof j2 === 'object' && j2.success === false) {
-            const msg2 = j2?.error?.message || JSON.stringify(j2.error || j2);
-            lastMsg = msg2; lastStatus = 502;
-            reportTokenResult(token, { ok: false, status: 502 });
-            continue;
-          }
-          if (!r2.ok) {
-            const msg2 = (j2 ? JSON.stringify(j2) : await readTextSafe(r2));
-            lastMsg = msg2; lastStatus = r2.status;
-            reportTokenResult(token, { ok: false, status: r2.status });
-            if (isRetryableStatus(r2.status)) continue;
-            return res.status(r2.status).json({ error: { message: msg2, type: 'upstream_error' } });
-          }
-
-          const result2 = j2?.result ?? j2 ?? await readTextSafe(r2);
+        if (wantStream && r1.ok && r1.body) {
           reportTokenResult(token, { ok: true, status: 200 });
-          const content2 = normalizeContent(result2?.message?.content ?? result2?.content ?? result2);
-
-          return res.status(200).json({
-            id: 'chatcmpl-' + Date.now(),
-            object: 'chat.completion',
-            created: Math.floor(Date.now() / 1000),
-            model: selectedModel,
-            choices: [{ index: 0, message: { role: 'assistant', content: content2 }, finish_reason: 'stop' }],
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-          });
+          return await streamAsOpenAI({ upstreamResponse: r1, res, selectedModel });
         }
 
+        const j1 = await readJsonSafe(r1);
+        
+        // If successful JSON response from Primary
+        if (r1.ok && (!j1 || j1.success !== false)) {
+            const result1 = j1?.result ?? j1 ?? await readTextSafe(r1);
+            reportTokenResult(token, { ok: true, status: 200 });
+            const content1 = normalizeContent(result1?.message?.content ?? result1?.content ?? result1);
+
+            return res.status(200).json({
+                id: 'chatcmpl-' + Date.now(),
+                object: 'chat.completion',
+                created: Math.floor(Date.now() / 1000),
+                model: selectedModel,
+                choices: [{ index: 0, message: { role: 'assistant', content: content1 }, finish_reason: 'stop' }],
+                usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            });
+        }
+
+        // Check failure
+        if (j1 && typeof j1 === 'object' && j1.success === false) {
+          const msg = j1?.error?.message || JSON.stringify(j1.error || j1);
+          // If error is NOT "No Implementation", it's a real error (e.g. rate limit). 
+          // But if it IS "No Impl", we just fall through to legacy below.
+          if (!isNoImplError(msg)) {
+             lastMsg = msg; lastStatus = 502;
+             reportTokenResult(token, { ok: false, status: 502 });
+             continue; // Retry next token or fail
+          }
+        } else if (!r1.ok) {
+           // Standard HTTP error on primary
+           const msg = (j1 ? JSON.stringify(j1) : await readTextSafe(r1));
+           lastMsg = msg; lastStatus = r1.status;
+           reportTokenResult(token, { ok: false, status: r1.status });
+           if (isRetryableStatus(r1.status)) continue;
+           return res.status(r1.status).json({ error: { message: msg, type: 'upstream_error' } });
+        }
+      }
+
+      // 2. Legacy Interface (Runs if forceLegacy=true OR Primary failed with "No Impl")
+      const { response: r2 } = await fetchUpstream({ token, body: legacyBody });
+
+      if (wantStream && r2.ok && r2.body) {
+        reportTokenResult(token, { ok: true, status: 200 });
+        return await streamAsOpenAI({ upstreamResponse: r2, res, selectedModel });
+      }
+
+      const j2 = await readJsonSafe(r2);
+      if (j2 && typeof j2 === 'object' && j2.success === false) {
+        const msg2 = j2?.error?.message || JSON.stringify(j2.error || j2);
+        lastMsg = msg2; lastStatus = 502;
+        reportTokenResult(token, { ok: false, status: 502 });
         continue;
       }
-
-      if (!r1.ok) {
-        const msg = (j1 ? JSON.stringify(j1) : await readTextSafe(r1));
-        lastMsg = msg; lastStatus = r1.status;
-        reportTokenResult(token, { ok: false, status: r1.status });
-        if (isRetryableStatus(r1.status)) continue;
-        return res.status(r1.status).json({ error: { message: msg, type: 'upstream_error' } });
+      if (!r2.ok) {
+        const msg2 = (j2 ? JSON.stringify(j2) : await readTextSafe(r2));
+        lastMsg = msg2; lastStatus = r2.status;
+        reportTokenResult(token, { ok: false, status: r2.status });
+        if (isRetryableStatus(r2.status)) continue;
+        return res.status(r2.status).json({ error: { message: msg2, type: 'upstream_error' } });
       }
 
-      const result1 = j1?.result ?? j1 ?? await readTextSafe(r1);
+      const result2 = j2?.result ?? j2 ?? await readTextSafe(r2);
       reportTokenResult(token, { ok: true, status: 200 });
-      const content1 = normalizeContent(result1?.message?.content ?? result1?.content ?? result1);
+      const content2 = normalizeContent(result2?.message?.content ?? result2?.content ?? result2);
 
       return res.status(200).json({
         id: 'chatcmpl-' + Date.now(),
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model: selectedModel,
-        choices: [{ index: 0, message: { role: 'assistant', content: content1 }, finish_reason: 'stop' }],
+        choices: [{ index: 0, message: { role: 'assistant', content: content2 }, finish_reason: 'stop' }],
         usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
       });
 
