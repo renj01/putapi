@@ -1,12 +1,10 @@
-// CommonJS token pool (local to api/v1/chat) to avoid module resolution issues on Vercel.
-// Env:
-// - PUTER_TOKENS: comma/newline/space separated
-// - PUTER_TOKEN: fallback single
-// - PUTER_TOKEN_COOLDOWN_MS: default 15min
-// - PUTER_TOKEN_MAX_ATTEMPTS: default 3
+// CommonJS -> ESM token pool for Vercel Edge Runtime
+// Env: PUTER_TOKENS, PUTER_TOKEN, PUTER_TOKEN_COOLDOWN_MS, PUTER_TOKEN_MAX_ATTEMPTS
 
 const DEFAULT_COOLDOWN_MS = 15 * 60 * 1000;
 
+// Note: In Edge runtime, global state is not guaranteed to persist across all requests,
+// but it works well enough for simple round-robin in warm instances.
 const state = { tokens: [], rrIndex: 0 };
 
 function parseTokens() {
@@ -32,12 +30,12 @@ function init() {
   state.rrIndex = 0;
 }
 
-function hasAnyToken() {
+export function hasAnyToken() {
   init();
   return state.tokens.length > 0;
 }
 
-function getToken() {
+export function getToken() {
   init();
   if (!state.tokens.length) return null;
 
@@ -57,7 +55,7 @@ function getToken() {
   return best.token;
 }
 
-function report(token, { ok, status }) {
+export function reportTokenResult(token, { ok, status }) {
   init();
   const entry = state.tokens.find(e => e.token === token);
   if (!entry) return;
@@ -86,5 +84,3 @@ function report(token, { ok, status }) {
 
   entry.disabledUntil = now + cooldownBase;
 }
-
-module.exports = { hasAnyToken, getToken, reportTokenResult: report };
