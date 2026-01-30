@@ -48,21 +48,43 @@ function isNoImplError(msg) {
   return typeof msg === 'string' && msg.includes('No implementation available for interface `puter-chat-completion`');
 }
 
-function hasWebSearchTool(tools) {
-  return Array.isArray(tools) && tools.some(t => t && String(t.type).toLowerCase() === 'web_search');
+// --- UPDATED: Web Search Detection & Transformation ---
+
+function hasSearchIntent(tools) {
+  if (!Array.isArray(tools)) return false;
+  return tools.some(t => {
+    if (!t) return false;
+    // 1. Puter native format
+    if (String(t.type).toLowerCase() === 'web_search') return true;
+    // 2. OpenAI function format (e.g. "web_search", "google_search", "browse")
+    if (t.type === 'function' && t.function?.name) {
+      const n = t.function.name.toLowerCase();
+      return n.includes('search') || n.includes('browse');
+    }
+    return false;
+  });
 }
 
 function sanitizeTools(tools, baseService) {
   if (!Array.isArray(tools)) return undefined;
-  const hasWS = hasWebSearchTool(tools);
-  if (!hasWS) return tools;
 
+  // If search intent is detected, force the tool format Puter expects.
+  // This fixes the issue where standard clients send { type: 'function' ... }
+  // but Puter expects { type: 'web_search' }.
+  if (hasSearchIntent(tools)) {
+    return [{ type: 'web_search' }];
+  }
+
+  // Otherwise, only pass tools if not explicitly restricted (legacy behavior)
   if (baseService !== 'openai') {
-    const filtered = tools.filter(t => !(t && String(t.type).toLowerCase() === 'web_search'));
-    return filtered.length ? filtered : undefined;
+     // If you want to support tools for other providers, remove this check.
+     // For now, keeping original logic for non-search tools.
+     return tools; 
   }
   return tools;
 }
+
+// -----------------------------------------------------
 
 function sseHeaders(res) {
   res.writeHead(200, {
@@ -127,7 +149,6 @@ async function streamAsOpenAI({ upstreamResponse, res, selectedModel }) {
   const created = Math.floor(Date.now() / 1000);
   const idBase = 'chatcmpl-' + Date.now();
 
-  // Immediate "data" heartbeat to flush bytes ASAP (no comment frames)
   writeSSE(res, {
     id: idBase,
     object: 'chat.completion.chunk',
@@ -136,7 +157,6 @@ async function streamAsOpenAI({ upstreamResponse, res, selectedModel }) {
     choices: [{ index: 0, delta: { content: '' }, finish_reason: null }]
   });
 
-  // Periodic keepalive as empty-content chunk
   const hb = startHeartbeat(res, () => ({
     id: idBase,
     object: 'chat.completion.chunk',
@@ -179,15 +199,13 @@ async function streamAsOpenAI({ upstreamResponse, res, selectedModel }) {
         if (line.startsWith('data:')) {
           const payload = line.slice(5).trim();
           if (payload === '[DONE]') {
-            buf = ''; // ignore remainder
+            buf = ''; 
             break;
           }
 
           let text = null;
           try {
             const j = JSON.parse(payload);
-
-            // If upstream is already OpenAI chunk, forward content if present
             text =
               j?.choices?.[0]?.delta?.content ??
               j?.choices?.[0]?.message?.content ??
@@ -278,8 +296,11 @@ module.exports = async function handler(req, res) {
   const baseService = pickServiceFromModel(selectedModel);
   const service = mapOpenAIService(baseService);
 
+  // --- UPDATED LOGIC HERE ---
+  // Detect intent first
+  const wantWebSearch = hasSearchIntent(tools);
+  // Transform tools to Puter format if search, otherwise pass through (sanitized)
   const safeTools = sanitizeTools(tools, baseService);
-  const wantWebSearch = baseService === 'openai' && hasWebSearchTool(safeTools);
 
   const allowTemp = baseService !== 'openai' || process.env.PUTER_OPENAI_ALLOW_TEMPERATURE === 'true';
 
@@ -311,6 +332,7 @@ module.exports = async function handler(req, res) {
 
     try {
       if (wantWebSearch) {
+        // Legacy body (puter.ai) handles the web_search tool correctly
         const { response: r } = await fetchUpstream({ token, body: legacyBody });
 
         if (wantStream && r.ok && r.body) {
@@ -347,6 +369,7 @@ module.exports = async function handler(req, res) {
         });
       }
 
+      // ... Standard flow (unchanged) ...
       const { response: r1 } = await fetchUpstream({ token, body: primaryBody });
 
       if (wantStream && r1.ok && r1.body) {
